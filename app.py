@@ -358,73 +358,128 @@ def excel_karsan(hdr, txs):
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NATIONAL CEMENT PARSER
+# NATIONAL CEMENT PARSER  (precise column-aware parser)
+# Columns: Date | Description | Cheque no | Vehicle No. | LPO No | Quantity |
+#          Invoice No. | CU Invoice Number | Location | Curr. | Debit | Credit | Balance
 # ══════════════════════════════════════════════════════════════════════════════
-DR4=re.compile(r"^\d{2}\.\d{2}\.\d{4}$"); MR=re.compile(r"^-?[\d,]+\.\d{2,3}$")
-QR=re.compile(r"^\d+\.\d{3}$")
+DR4     = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+MONEY_N = re.compile(r"^[\d,]+\.\d{2}$")
+QTY_N   = re.compile(r"^\d+\.\d{3}$")
+LPOSUF  = re.compile(r"^\d{7,8}$")   # LPO suffix split to next line e.g. 06005663
 
 def parse_national(lines):
-    hdr={}
+    hdr = {}
     for ln in lines[:20]:
-        m=re.search(r"Statement As At:\s*([\d.]+)",ln)
-        if m: hdr["statement_date"]=m.group(1)
-        m=re.search(r"PIN No:\s*(\S+)",ln)
-        if m: hdr["pin"]=m.group(1)
-    for ln in lines[:5]:
-        if "CEMENT" in ln.upper() and "LTD" in ln.upper():
-            hdr["supplier"]=ln.strip().split("  ")[0].strip(); break
-    hdr.setdefault("supplier","National Cement Company Ltd")
-    for i,ln in enumerate(lines):
-        if "Customer Statement" in ln and i>0:
-            hdr["customer"]=lines[i-1].strip(); break
-    hdr.setdefault("customer","")
-    txs,chqs,in_chq=[],[],False
-    i=0
-    while i<len(lines):
-        ln=lines[i].strip()
-        if "Cheques on Hand" in ln: in_chq=True; i+=1; continue
+        m = re.search(r"Statement As At:\s*([\d.]+)", ln)
+        if m: hdr["statement_date"] = m.group(1)
+        m = re.search(r"PIN No:\s*(\S+)", ln)
+        if m: hdr["pin"] = m.group(1)
+        if "NATIONAL CEMENT" in ln.upper(): hdr["supplier"] = "National Cement Company Ltd"
+        if "New Muthokinju" in ln: hdr["customer"] = "New Muthokinju Hardware Ltd"
+    hdr.setdefault("supplier", "National Cement Company Ltd")
+    hdr.setdefault("customer", "New Muthokinju Hardware Ltd")
+
+    txs = []; chqs = []; in_chq = False
+    i = 0
+    while i < len(lines):
+        ln = lines[i].strip()
+
+        if "Cheques on Hand" in ln: in_chq = True; i+=1; continue
         if "Cheque No" in ln and "Due On" in ln: i+=1; continue
+        if "Total/Closing" in ln or "Ageing" in ln or "Total" == ln.split()[0] if ln.split() else False:
+            i+=1; continue
+
         if in_chq:
-            p=ln.split()
-            if len(p)>=3:
-                try:
-                    amt=pn(p[-1]); dt=p[-2] if DR4.match(p[-2]) else ""
-                    if amt: chqs.append({"cheque_no":p[0],"due_on":dt,"amount":amt})
+            p = ln.split()
+            if len(p) == 3 and DR4.match(p[1]):
+                try: chqs.append({"cheque_no":p[0],"due_on":p[1],"amount":float(p[2].replace(",",""))})
                 except: pass
             i+=1; continue
-        if "Total" in ln and "Closing" in ln: i+=1; continue
-        p=ln.split()
-        if not p or not DR4.match(p[0]): i+=1; continue
-        date=p[0]; rest=p[1:]
-        j=i+1
-        while j<len(lines):
-            nx=lines[j].strip()
-            if not nx or DR4.match(nx.split()[0] if nx.split() else "") \
-               or any(k in nx for k in ("Total","Ageing","Cheque")): break
-            if re.match(r"^\d{5,}",nx) and rest: rest[-1]+=nx
-            j+=1
-        i=j
-        amts,nonamts,dc=[],[],""
-        for x in reversed(rest):
-            if x in ("DR","CR"): dc=x
-            elif MR.match(x.replace(",","")): amts.insert(0,pn(x))
+
+        parts = ln.split()
+        if not parts or not DR4.match(parts[0]): i+=1; continue
+
+        date = parts[0]
+        rest = list(parts[1:])
+
+        # Consume LPO suffix on next line (pure 7-8 digit number like 06005663)
+        lpo_suffix = ""
+        if i+1 < len(lines):
+            nxt = lines[i+1].strip()
+            if LPOSUF.match(nxt):
+                lpo_suffix = nxt
+                i += 1
+
+        # Balance B/F line
+        if rest and rest[0] == "Balance":
+            dr_cr = rest[-1] if rest[-1] in ("DR","CR") else ""
+            nums = [x for x in rest if MONEY_N.match(x)]
+            bal = float(nums[-1].replace(",","")) if nums else None
+            bal_disp = f"{bal:,.2f} {dr_cr}".strip() if bal is not None else None
+            txs.append({"date":date,"description":"Balance B/F","cheque_no":"",
+                        "vehicle":"","lpo_no":"","quantity":None,
+                        "invoice_no":"","cu_invoice":"","location":"",
+                        "currency":"KES","debit":0.0,"credit":0.0,
+                        "balance":bal,"balance_disp":bal_disp,"is_bf":True})
+            i+=1; continue
+
+        # Normal Invoice line
+        # Structure after date: Invoice VEHICLE [LPO_PREFIX] QTY INV_NO CU_INV LOCATION KES DEBIT CREDIT BALANCE DR
+        desc = rest[0] if rest else "Invoice"
+        rest = rest[1:]  # skip "Invoice"
+
+        # Find QTY position (e.g. 245.000) — anchors the columns
+        qty_idx = next((j for j,x in enumerate(rest) if QTY_N.match(x)), None)
+        if qty_idx is None: i+=1; continue
+
+        before_qty = rest[:qty_idx]    # VEHICLE tokens + optional LPO prefix
+        after_qty  = rest[qty_idx:]    # QTY INV_NO CU_INV LOCATION KES DEBIT CREDIT BALANCE DR
+
+        qty = float(after_qty[0].replace(",","")) if after_qty else None
+        tail = list(after_qty[1:])
+
+        # Strip DR/CR from end
+        dr_cr = ""
+        if tail and tail[-1] in ("DR","CR"): dr_cr = tail.pop()
+        # Last 3 numbers: balance, credit, debit
+        balance = float(tail.pop().replace(",","")) if tail and MONEY_N.match(tail[-1]) else None
+        balance_disp = f"{balance:,.2f} {dr_cr}".strip() if balance is not None else None
+        credit  = float(tail.pop().replace(",","")) if tail and MONEY_N.match(tail[-1]) else None
+        debit   = float(tail.pop().replace(",","")) if tail and MONEY_N.match(tail[-1]) else None
+        # Next: currency (KES)
+        curr = tail.pop() if tail else "KES"
+        # Remaining: inv_no, cu_inv, location (1-2 words)
+        inv_no   = tail[0] if len(tail) >= 1 else ""
+        cu_inv   = tail[1] if len(tail) >= 2 else ""
+        location = " ".join(tail[2:]) if len(tail) >= 3 else ""
+
+        # before_qty: vehicle plate + optional LPO prefix
+        # LPO prefix: starts with POHH or is short numeric (4-5 digits like 5474)
+        vehicle = ""; lpo_prefix = ""
+        if before_qty:
+            last = before_qty[-1]
+            if re.match(r"^POHH\d+$", last) or re.match(r"^\d{4,5}$", last):
+                lpo_prefix = last
+                vehicle = " ".join(before_qty[:-1])
             else:
-                nonamts.insert(0,x)
-                if len(amts)>=3: break
-        na=nonamts
-        desc=na[0] if len(na)>0 else ""; vehicle=na[1] if len(na)>1 else ""
-        lpo=na[2] if len(na)>2 else ""; qty=pn(na[3]) if len(na)>3 and QR.match(na[3]) else None
-        inv=na[4] if len(na)>4 else ""; cu=na[5] if len(na)>5 else ""
-        loc=na[6] if len(na)>6 else ""; curr=na[7] if len(na)>7 else ""
-        dbt=crd=bal=None
-        if len(amts)>=3: dbt,crd,bal=amts[-3],amts[-2],amts[-1]
-        elif len(amts)==2: dbt,bal=amts[0],amts[1]
-        elif len(amts)==1: bal=amts[0]
-        if desc=="Balance": desc="Balance B/F"
-        txs.append({"date":date,"description":desc,"cheque_no":"","vehicle":vehicle,
-                    "lpo_no":lpo,"quantity":qty,"invoice_no":inv,"cu_invoice":cu,
-                    "location":loc,"currency":curr,"debit":dbt,"credit":crd,"balance":bal})
-    return hdr,txs,chqs
+                vehicle = " ".join(before_qty)
+
+        # Build full LPO number
+        if lpo_prefix and lpo_suffix:
+            lpo_no = lpo_prefix + lpo_suffix          # e.g. POHH0012606005663
+        elif lpo_prefix:
+            lpo_no = lpo_prefix                        # e.g. 5474 (Nakuru style)
+        else:
+            lpo_no = lpo_suffix                        # fallback
+
+        txs.append({"date":date,"description":desc,"cheque_no":"",
+                    "vehicle":vehicle,"lpo_no":lpo_no,"quantity":qty,
+                    "invoice_no":inv_no,"cu_invoice":cu_inv,"location":location,
+                    "currency":curr,"debit":debit,"credit":credit,"balance":balance,
+                    "balance_disp":balance_disp,"is_bf":False})
+        i += 1
+
+    return hdr, txs, chqs
 
 def excel_national(hdr,txs,chqs):
     wb=openpyxl.Workbook(); ws=wb.active; ws.title="Statement"
@@ -454,23 +509,27 @@ def excel_national(hdr,txs,chqs):
         bg=C["info_bg"] if bf else (C["alt_row"] if (ri-D)%2==1 else None)
         vals=[tx["date"],tx["description"],tx["cheque_no"],tx["vehicle"],tx["lpo_no"],
               tx["quantity"],tx["invoice_no"],tx["cu_invoice"],tx["location"],tx["currency"],
-              tx["debit"],tx["credit"],tx["balance"]]
+              tx["debit"],tx["credit"],tx.get("balance_disp", tx["balance"])]
         aligns=["center","left","center","center","center","right","center","center",
                 "center","center","right","right","right"]
-        fmts=[None,None,None,None,None,"#,##0.000",None,None,None,None,MFMT,MFMT,MFMT]
+        fmts=[None,None,None,None,None,"#,##0.000",None,None,None,None,MFMT,MFMT,None]
         fgs=["000000"]*10+[C["debit_fg"],C["credit_fg"],"000000"]
         for ci,(v,a,f,fg) in enumerate(zip(vals,aligns,fmts,fgs),1):
-            if ci==13 and v is not None: fg=C["neg_bal"] if v<0 else C["credit_fg"]
             wc(ws,ri,ci,v,align=a,fmt=f,fg=fg,bg=bg,bdr=thin("bottom"))
         ws.row_dimensions[ri].height=15
     T=D+len(txs)
     ws.merge_cells(f"A{T}:J{T}")
     wc(ws,T,1,"TOTAL",bold=True,fg=C["col_hdr_fg"],bg=C["national_blue"],align="right",bdr=thin(),ind=1)
-    for ci,col in [(11,"K"),(12,"L"),(13,"M")]:
+    for ci,col in [(11,"K"),(12,"L")]:
         c=ws.cell(row=T,column=ci,value=f"=SUM({col}{D}:{col}{T-1})")
         c.font=Font(name="Arial",bold=True,size=9,color=C["col_hdr_fg"])
         c.fill=PatternFill("solid",start_color=C["national_blue"])
         c.number_format=MFMT; c.alignment=Alignment(horizontal="right",vertical="center"); c.border=thin()
+    last_bal = txs[-1].get("balance_disp","") if txs else ""
+    c=ws.cell(row=T,column=13,value=last_bal)
+    c.font=Font(name="Arial",bold=True,size=9,color=C["col_hdr_fg"])
+    c.fill=PatternFill("solid",start_color=C["national_blue"])
+    c.alignment=Alignment(horizontal="right",vertical="center"); c.border=thin()
     ws.row_dimensions[T].height=18
     ws.freeze_panes=f"A{D}"; ws.auto_filter.ref=f"A{H}:M{T-1}"
     ws.page_setup.orientation="landscape"; ws.page_setup.fitToPage=True; ws.page_setup.fitToWidth=1
