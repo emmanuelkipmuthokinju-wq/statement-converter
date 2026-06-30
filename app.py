@@ -9,33 +9,88 @@ from pathlib import Path
 st.set_page_config(page_title="Statement PDF → Excel", page_icon="📄", layout="centered")
 st.markdown("""
 <style>
-.hero{background:linear-gradient(135deg,#1e3a5f,#2563eb);border-radius:16px;
-      padding:36px 32px 28px;margin-bottom:28px;color:white;text-align:center}
-.hero h1{font-size:2rem;margin:0 0 8px;font-weight:700}
-.hero p{font-size:1rem;opacity:.85;margin:0}
-.badge{display:inline-block;background:rgba(255,255,255,.18);border-radius:20px;
-       padding:3px 14px;font-size:.8rem;margin:10px 4px 0}
-.ok{background:#f0fdf4;border:1px solid #86efac;border-radius:10px;
-    padding:16px 20px;color:#166534;font-weight:500;margin-top:12px}
-.stDownloadButton>button{background:#2563eb!important;color:white!important;
-    border-radius:8px!important;padding:10px 24px!important;font-size:1rem!important;
-    font-weight:600!important;width:100%!important;border:none!important}
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700;800&display=swap');
+
+html, body, [class*="css"] { font-family:'Poppins',sans-serif; }
+.stApp { background: linear-gradient(160deg,#fdf2ff 0%,#eef4ff 45%,#fff8ec 100%); }
+
+.hero{
+  background: linear-gradient(120deg,#ff5f6d 0%,#a06be0 35%,#3b82f6 70%,#06b6d4 100%);
+  background-size: 200% 200%;
+  animation: gradientshift 8s ease infinite;
+  border-radius: 24px;
+  padding: 42px 32px 34px;
+  margin-bottom: 26px;
+  color: white;
+  text-align: center;
+  box-shadow: 0 18px 40px -12px rgba(124,58,237,.45);
+}
+@keyframes gradientshift{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+
+.hero h1{font-size:2.3rem;margin:0 0 10px;font-weight:800;letter-spacing:-.5px;
+  text-shadow:0 2px 12px rgba(0,0,0,.15)}
+.hero p{font-size:1.05rem;opacity:.95;margin:0 0 4px;font-weight:400}
+
+.badge{display:inline-block;background:rgba(255,255,255,.22);backdrop-filter:blur(6px);
+       border:1px solid rgba(255,255,255,.35);border-radius:24px;
+       padding:5px 16px;font-size:.82rem;font-weight:600;margin:10px 5px 0}
+
+.ok{
+  background: linear-gradient(120deg,#d1fae5,#ecfeff);
+  border: 1.5px solid #34d399;
+  border-radius: 16px;
+  padding: 18px 22px;
+  color:#065f46;
+  font-weight:600;
+  margin-top:14px;
+  box-shadow: 0 6px 18px -8px rgba(16,185,129,.35);
+}
+
+div[data-testid="stExpander"]{
+  border-radius:16px!important; border:1.5px solid #e9d5ff!important;
+  background:white!important; box-shadow:0 4px 14px -8px rgba(124,58,237,.25)!important;
+}
+
+section[data-testid="stFileUploaderDropzone"]{
+  border-radius:18px!important; border:2px dashed #a855f7!important;
+  background: linear-gradient(135deg,#fdf4ff,#eef2ff)!important;
+}
+
+.stDownloadButton>button{
+  background: linear-gradient(120deg,#f97316,#ec4899,#8b5cf6)!important;
+  background-size:200% 100%!important;
+  color:white!important; border-radius:14px!important;
+  padding:13px 24px!important; font-size:1.05rem!important;
+  font-weight:700!important; width:100%!important; border:none!important;
+  box-shadow:0 10px 24px -8px rgba(236,72,153,.55)!important;
+  transition:all .25s ease!important;
+}
+.stDownloadButton>button:hover{
+  background-position:100% 0!important; transform:translateY(-2px)!important;
+  box-shadow:0 14px 30px -8px rgba(236,72,153,.7)!important;
+}
+
+.footer-note{
+  text-align:center; color:#9333ea; font-size:.85rem; font-weight:600;
+  background:linear-gradient(90deg,#fdf4ff,#eef2ff); border-radius:12px;
+  padding:12px; margin-top:8px;
+}
 </style>
 """, unsafe_allow_html=True)
 
 st.markdown("""
 <div class="hero">
-  <h1>📄 Statement → Excel</h1>
-  <p>Upload a customer statement PDF and download a clean, formatted Excel file instantly.</p>
-  <span class="badge">✅ Savannah Cement</span>
-  <span class="badge">✅ National Cement</span>
-  <span class="badge">✅ Mombasa Cement</span>
-  <span class="badge">✅ Karsan Ramji</span>
+  <h1>📄✨ Statement → Excel</h1>
+  <p>Upload a customer statement PDF and get a beautifully formatted Excel file in seconds.</p>
+  <span class="badge">🟠 Savannah Cement</span>
+  <span class="badge">🔵 National Cement</span>
+  <span class="badge">🟢 Mombasa Cement</span>
+  <span class="badge">🟣 Karsan Ramji</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
 """, unsafe_allow_html=True)
 
-with st.expander("📋 Supported formats"):
+with st.expander("🎨 Supported formats"):
     st.markdown("""
 | Supplier | Key Columns |
 |---|---|
@@ -687,8 +742,8 @@ def convert(pdf_bytes):
 uploaded=st.file_uploader("Drop your PDF here",type=["pdf","PDF"],label_visibility="collapsed")
 
 if uploaded:
-    st.markdown(f"**Uploaded:** `{uploaded.name}` &nbsp;({uploaded.size/1024:.1f} KB)")
-    with st.spinner("Converting…"):
+    st.markdown(f"📎 **Uploaded:** `{uploaded.name}` &nbsp;({uploaded.size/1024:.1f} KB)")
+    with st.spinner("✨ Converting your statement…"):
         try:
             fmt,tx_count,chq_count,pages,buf=convert(uploaded.read())
         except Exception as e:
@@ -701,8 +756,8 @@ if uploaded:
                 "mombasa":"Mombasa Cement","karsan":"Karsan Ramji (Ndovu)"}
         label=labels.get(fmt,fmt)
         chq_txt=f" · {chq_count} cheques" if chq_count else ""
-        st.markdown(f"""<div class="ok">✅ &nbsp;<b>{label}</b> converted &nbsp;·&nbsp;
-        {pages} page(s) &nbsp;·&nbsp; {tx_count} transactions{chq_txt}</div>""",
+        st.markdown(f"""<div class="ok">🎉 &nbsp;<b>{label}</b> converted successfully! &nbsp;·&nbsp;
+        📄 {pages} page(s) &nbsp;·&nbsp; 🧾 {tx_count} transactions{chq_txt}</div>""",
         unsafe_allow_html=True)
         st.write("")
         st.download_button("⬇️  Download Excel File",data=buf,
@@ -710,5 +765,5 @@ if uploaded:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 st.markdown("---")
-st.markdown("<div style='text-align:center;color:#94a3b8;font-size:.8rem'>"
-            "Files processed in memory · never stored · free to use</div>",unsafe_allow_html=True)
+st.markdown('<div class="footer-note">✨ Files processed in memory · never stored · free to use ✨</div>',
+            unsafe_allow_html=True)
