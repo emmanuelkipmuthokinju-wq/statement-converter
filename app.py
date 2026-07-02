@@ -91,6 +91,8 @@ st.markdown("""
   <span class="badge">🔴 Scania</span>
   <span class="badge">🟩 Trans-Solutions</span>
   <span class="badge">🟧 AutoXpress</span>
+  <span class="badge">🟥 Gathani</span>
+  <span class="badge">🩵 Anco Trading</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
 """, unsafe_allow_html=True)
@@ -108,6 +110,8 @@ with st.expander("🎨 Supported formats"):
 | 🔴 **Scania East Africa** | Date · Invoice · Description · Due Date · Debit · Credit · Balance |
 | 🟩 **Trans-Solutions (E.A)** | Date · Transaction · Amount · Balance + Ageing Summary sheet |
 | 🟧 **AutoXpress** | Date · Tax Invoice · GP Invoice · LPO · Opening Bal · Invoice · Payment · Cummulative + Ageing Summary sheet |
+| 🟥 **Gathani Limited** | Date · Particulars · Doc Ref · Debit · Credit · Nett Amount + Ageing Summary sheet |
+| 🩵 **Anco Trading Ltd** | Transaction · Doc No · Ref No · Doc Date · DR/CR · Debit · Credit · Balance + Ageing Analysis sheet |
     """)
 
 # ── Colours & helpers ──────────────────────────────────────────────────────────
@@ -117,7 +121,8 @@ C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20
          info_bg="ECF0F1", debit_fg="1565C0", credit_fg="2E7D32",
          neg_bal="C62828", border="BDBDBD",
          skylife_teal="00838F", springtech_indigo="3F51B5", scania_red="C8102E",
-         transsolutions_cyan="0097A7", autoxpress_amber="F57C00")
+         transsolutions_cyan="0097A7", autoxpress_amber="F57C00",
+         gathani_maroon="7B1C1C", anco_teal="00695C")
 MFMT = '#,##0.00;(#,##0.00);"-"'
 IFMT = '#,##0;(#,##0);"-"'
 
@@ -188,6 +193,8 @@ def detect(lines):
     if "LPO No" in t or "Cheque no" in t:                             return "national"
     if "Due Date" in t and "Document" in t:                           return "savannah"
     if "AR Invoice" in t and "BP REF" in t:                           return "karsan"
+    if "GATHANI" in t.upper():                                         return "gathani"
+    if "ANCO TRADING" in t.upper():                                    return "anco"
     return "unknown"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1259,6 +1266,406 @@ def excel_autoxpress(hdr, txs):
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 # ══════════════════════════════════════════════════════════════════════════════
+# GATHANI LIMITED PARSER
+# Format: Date | Particulars | Document Ref | Debit | Credit | Nett Amount
+# Dates like "2-Jun-26", amounts like "31,668.00 Dr"
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_GTH = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{2}$")
+MONEY_GTH = re.compile(r"^[\d,]+\.\d{2}$")
+
+def parse_gathani(lines):
+    hdr = {
+        "supplier": "Gathani Limited",
+        "customer": "", "address": "", "contact": "",
+        "as_at": "", "pin": "",
+        "buckets": {}
+    }
+    for ln in lines:
+        m = re.search(r"NEW MUTHOKINJU", ln, re.I)
+        if m: hdr["customer"] = "New Muthokinju Hardware Ltd"
+        m = re.search(r"As At\s*:\s*(\S+)", ln)
+        if m: hdr["as_at"] = m.group(1)
+        m = re.search(r"PIN NO\s*:\s*(\S+)", ln)
+        if m: hdr["pin"] = m.group(1)
+        m = re.search(r"MARIANA ROSE[:\s]+(\S+)", ln, re.I)
+        if m: hdr["contact"] = m.group(1)
+        # Ageing buckets line: "88,102.00 Dr   6,960.00 Dr ..."
+        if re.search(r"\d{1,3}(?:,\d{3})*\.\d{2}\s+Dr", ln) and "Days" not in ln:
+            nums = re.findall(r"([\d,]+\.\d{2})\s*(Dr|Cr)?", ln)
+            keys = ["0_30","30_60","60_90","90_120","above_120","balance_due"]
+            for ki, (amt, drcr) in enumerate(nums):
+                if ki < len(keys):
+                    v = pnf(amt)
+                    if drcr and drcr.upper() == "CR" and v: v = -v
+                    hdr["buckets"][keys[ki]] = v
+
+    txs = []
+    skip_kw = {"Date","Particulars","Document","Ref","Nett",
+               "Amount","GATHANI","Gathani","Page","STATEMENT","PO BOX",
+               "Tel:","EMAIL","PIN","Pls","Industrial","0-30","Bank","867386",
+               "KYANGOMBE","MARIANA"}
+
+    for ln in lines:
+        ln = ln.strip()
+        if not ln: continue
+        if any(k in ln for k in skip_kw): continue
+
+        parts = ln.split()
+        if not parts: continue
+
+        # Opening Balance line
+        if parts[0] == "Opening" and "Balance" in ln:
+            nums = [(pnf(p), parts[i+1] if i+1 < len(parts) else "") for i,p in enumerate(parts) if MONEY_GTH.match(p)]
+            if nums:
+                amt, drcr = nums[0]
+                txs.append({
+                    "date": "--", "particulars": "Opening Balance",
+                    "doc_ref": "", "debit": None, "credit": None,
+                    "nett_amount": amt, "drcr": drcr, "is_opening": True
+                })
+            continue
+
+        # Normal transaction line: date at start
+        if not DATE_GTH.match(parts[0]): continue
+        date = parts[0]
+        rest = parts[1:]
+
+        # Find all money values and their DR/CR suffix
+        money_vals = []
+        desc_parts = []
+        i = 0
+        while i < len(rest):
+            if MONEY_GTH.match(rest[i]):
+                drcr = rest[i+1] if i+1 < len(rest) and rest[i+1] in ("Dr","Cr","DR","CR") else ""
+                money_vals.append((pnf(rest[i]), drcr))
+                if drcr: i += 2
+                else: i += 1
+            else:
+                desc_parts.append(rest[i])
+                i += 1
+
+        # desc_parts: [Particulars..., DocRef] — last token is doc ref if numeric
+        doc_ref = ""
+        particulars = ""
+        if desc_parts:
+            if re.match(r"^\d+$", desc_parts[-1]):
+                doc_ref = desc_parts[-1]
+                particulars = " ".join(desc_parts[:-1])
+            else:
+                particulars = " ".join(desc_parts)
+
+        is_credit = "Credit" in particulars or "credit" in particulars
+        debit = credit = nett = None
+        if len(money_vals) >= 2:
+            # last is nett balance, before last is the transaction amount
+            nett, nett_drcr = money_vals[-1]
+            tx_amt, tx_drcr = money_vals[-2]
+            if is_credit or tx_drcr.upper() == "CR":
+                credit = tx_amt
+            else:
+                debit = tx_amt
+        elif len(money_vals) == 1:
+            nett, nett_drcr = money_vals[0]
+        else:
+            continue
+
+        txs.append({
+            "date": date, "particulars": particulars, "doc_ref": doc_ref,
+            "debit": debit, "credit": credit, "nett_amount": nett,
+            "drcr": nett_drcr if len(money_vals) >= 1 else "", "is_opening": False
+        })
+
+    return hdr, txs
+
+def excel_gathani(hdr, txs):
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws.title = "Statement"; ws.sheet_properties.tabColor = C["gathani_maroon"]
+    for i, w in enumerate([14, 20, 14, 18, 18, 20], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    banner(ws, 1, 6, "GATHANI LIMITED  |  STATEMENT OF ACCOUNT", C["gathani_maroon"])
+
+    lf = Font(name="Arial", bold=True, size=9)
+    vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [
+        ("Customer", hdr.get("customer",""), "As At", hdr.get("as_at","")),
+        ("PIN No.", hdr.get("pin",""),        "Contact", hdr.get("contact","")),
+    ]
+    for r, (l1,v1,l2,v2) in enumerate(info, start=2):
+        for ci,lbl,val in [(1,l1,v1),(4,l2,v2)]:
+            ws.merge_cells(start_row=r,start_column=ci,end_row=r,end_column=ci+1)
+            lc = ws.cell(row=r, column=ci, value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
+            vc = ws.cell(row=r, column=ci+2, value=val); vc.font=vf; vc.alignment=al
+        ws.row_dimensions[r].height = 16
+
+    H = 4
+    col_headers(ws, H, ["Date","Particulars","Doc / Ref No.",
+                         "Debit (KES)","Credit (KES)","Nett Amount (KES)"], C["gathani_maroon"])
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_open = tx.get("is_opening", False)
+        is_cr   = tx["credit"] is not None and not is_open
+        bg = C["info_bg"] if is_open else (C["credit_row"] if is_cr else (C["alt_row"] if (ri-D)%2==1 else None))
+        vals   = [tx["date"], tx["particulars"], tx["doc_ref"],
+                  tx["debit"], tx["credit"], tx["nett_amount"]]
+        aligns = ["center","left","center","right","right","right"]
+        fmts   = [None, None, None, MFMT, MFMT, MFMT]
+        fgs    = ["000000","000000","000000",C["debit_fg"],C["credit_fg"],"000000"]
+        for ci,(v,a,f,fg) in enumerate(zip(vals,aligns,fmts,fgs),1):
+            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
+        ws.row_dimensions[ri].height = 15
+
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:C{T}")
+    wc(ws,T,1,"TOTAL",bold=True,fg=C["col_hdr_fg"],bg=C["gathani_maroon"],align="right",bdr=thin(),ind=1)
+    for ci, col in [(4,"D"),(5,"E")]:
+        c = ws.cell(row=T,column=ci,value=f"=SUM({col}{D}:{col}{T-1})")
+        c.font=Font(name="Arial",bold=True,size=9,color=C["col_hdr_fg"])
+        c.fill=PatternFill("solid",start_color=C["gathani_maroon"])
+        c.number_format=MFMT; c.alignment=Alignment(horizontal="right",vertical="center"); c.border=thin()
+    last_nett = txs[-1]["nett_amount"] if txs else None
+    c = ws.cell(row=T,column=6,value=last_nett)
+    c.font=Font(name="Arial",bold=True,size=9,color=C["col_hdr_fg"])
+    c.fill=PatternFill("solid",start_color=C["gathani_maroon"])
+    c.number_format=MFMT; c.alignment=Alignment(horizontal="right",vertical="center"); c.border=thin()
+    ws.row_dimensions[T].height = 18
+
+    # Ageing sheet
+    b = hdr.get("buckets", {})
+    if any(v is not None for v in b.values()):
+        ws2 = wb.create_sheet("Ageing Summary"); ws2.sheet_properties.tabColor = C["gathani_maroon"]
+        for col,w in [("A",22),("B",18)]: ws2.column_dimensions[col].width = w
+        ws2.merge_cells("A1:B1")
+        wc(ws2,1,1,"AGEING SUMMARY",bold=True,fg=C["col_hdr_fg"],bg=C["gathani_maroon"],align="center",sz=12)
+        ws2.row_dimensions[1].height=26
+        rows2 = [
+            ("0–30 Days",    b.get("0_30")),
+            ("30–60 Days",   b.get("30_60")),
+            ("60–90 Days",   b.get("60_90")),
+            ("90–120 Days",  b.get("90_120")),
+            ("Above 120 Days",b.get("above_120")),
+            ("Balance Due",  b.get("balance_due")),
+        ]
+        for ri,(lbl,val) in enumerate(rows2,start=2):
+            bold = lbl == "Balance Due"
+            bg2  = C["info_bg"] if bold else None
+            wc(ws2,ri,1,lbl,bold=bold,align="left",bdr=thin("bottom"),bg=bg2)
+            wc(ws2,ri,2,val,align="right",fmt=MFMT,bdr=thin("bottom"),
+               fg=C["neg_bal"] if (val or 0)<0 else "000000",bg=bg2)
+            ws2.row_dimensions[ri].height=16
+
+    ws.freeze_panes=f"A{D}"; ws.auto_filter.ref=f"A{H}:F{T-1}"
+    ws.page_setup.orientation="landscape"; ws.page_setup.fitToPage=True; ws.page_setup.fitToWidth=1
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANCO TRADING LTD PARSER
+# Format: TRANSACTION | DOCNO | REF NO | DOC DATE | DRCR | DEBIT | CREDIT | BALANCE
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_ANCO  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+MONEY_ANCO = re.compile(r"^[\d,]+\.\d{2}$")
+
+def parse_anco(lines):
+    hdr = {
+        "supplier": "Anco Trading Ltd",
+        "customer": "", "client_code": "", "email": "",
+        "pin": "", "credit_days": "", "credit_limit": "",
+        "period": "", "total_outstanding": None,
+        "buckets": {}
+    }
+    for ln in lines:
+        m = re.search(r"Client Name\s*:\s*(.+?)(?:\s{3,}|Client Adress|Client Postal|$)", ln)
+        if m:
+            name = m.group(1).strip()
+            # Remove trailing noise from same-line columns
+            name = re.split(r'\s{2,}', name)[0].strip()
+            if name: hdr["customer"] = name
+        if ln.strip() == "LIMITED" and hdr.get("customer","").endswith("HARDWARE"):
+            hdr["customer"] += " LIMITED"
+        m = re.search(r"Client Code\s*:\s*(\S+)", ln)
+        if m: hdr["client_code"] = m.group(1)
+        m = re.search(r"Client Email\s*:\s*(\S+)", ln)
+        if m: hdr["email"] = m.group(1)
+        m = re.search(r"Client Pin No\s*:\s*(\S+)", ln)
+        if m: hdr["pin"] = m.group(1)
+        m = re.search(r"Client Credit Days\s+([\d.]+)", ln)
+        if m: hdr["credit_days"] = m.group(1)
+        m = re.search(r"Client Credit Limit\s+([\d,]+(?:\.\d+)?)", ln)
+        if m: hdr["credit_limit"] = m.group(1)
+        m = re.search(r"BETWEEN\s+(\S+)\s+AND\s+(\S+)", ln)
+        if m: hdr["period"] = f"{m.group(1)} to {m.group(2)}"
+        m = re.search(r"TOTAL OUTSTANDING\s+([\d,]+\.\d{2})", ln)
+        if m: hdr["total_outstanding"] = pnf(m.group(1))
+        # Ageing buckets
+        m = re.search(r"0-30 days\s+30-60 days\s+60-90 days\s+<90 days\s+Total", ln, re.I)
+        if m: _ageing_next = True
+    # Re-scan for ageing values
+    for i, ln in enumerate(lines):
+        if re.search(r"0-30 days", ln, re.I) and i+1 < len(lines):
+            nums = re.findall(r"[\d,]+\.\d{2}", lines[i+1])
+            keys = ["0_30","30_60","60_90","lt90","total"]
+            for ki,n in enumerate(nums):
+                if ki < len(keys): hdr["buckets"][keys[ki]] = pnf(n)
+
+    txs = []
+    skip_kw = {"TRANSACTION","DOCNO","REF NO","DOC DATE","DRCR","DEBIT","CREDIT",
+               "ANCO","Client","BETWEEN","TOTAL","AGEING","0-30","days","OUTSTANDING"}
+
+    for ln in lines:
+        ln = ln.strip()
+        if not ln: continue
+        if any(k in ln for k in skip_kw): continue
+
+        parts = ln.split()
+        if not parts: continue
+
+        # Opening Balance
+        if parts[0] == "OPENING" and len(parts) >= 3:
+            # OPENING BALANCE 1 OPENING BALANCE 01/04/2026 DR 244,240.20 0.00 244,240.20
+            nums = [p for p in parts if MONEY_ANCO.match(p)]
+            date_m = [p for p in parts if DATE_ANCO.match(p)]
+            drcr = "DR" if "DR" in parts else "CR"
+            debit = pnf(nums[0]) if len(nums) >= 3 else None
+            credit = pnf(nums[1]) if len(nums) >= 3 else None
+            balance = pnf(nums[2]) if len(nums) >= 3 else pnf(nums[0]) if nums else None
+            txs.append({
+                "transaction": "OPENING BALANCE", "doc_no": "",
+                "ref_no": "Opening Balance", "doc_date": date_m[0] if date_m else "--",
+                "drcr": drcr, "debit": debit, "credit": credit, "balance": balance,
+                "is_opening": True
+            })
+            continue
+
+        # Must start with known transaction types
+        tx_types = ("SINV","RECIEPT","RECEIPT","JOURNAL","CREDIT","DEBIT")
+        if not any(parts[0].upper().startswith(t) for t in tx_types): continue
+
+        # Find amounts: last 3 money values = debit, credit, balance
+        money_idx = [i for i,p in enumerate(parts) if MONEY_ANCO.match(p)]
+        date_idx  = [i for i,p in enumerate(parts) if DATE_ANCO.match(p)]
+
+        if len(money_idx) < 2: continue
+
+        balance = pnf(parts[money_idx[-1]])
+        credit  = pnf(parts[money_idx[-2]])
+        debit   = pnf(parts[money_idx[-3]]) if len(money_idx) >= 3 else None
+
+        # DRCR flag
+        drcr_idx = next((i for i,p in enumerate(parts) if p in ("DR","CR")), None)
+        drcr = parts[drcr_idx] if drcr_idx is not None else ("CR" if (credit or 0)>0 else "DR")
+
+        # doc_date: last date token
+        doc_date = parts[date_idx[-1]] if date_idx else ""
+        # ref_no: second date token if two dates exist, else empty
+        ref_no = parts[date_idx[0]] if len(date_idx) >= 2 else ""
+
+        # Between tx type and first date/money: doc_no and ref
+        pivot = min((date_idx + money_idx + ([drcr_idx] if drcr_idx else [])), default=len(parts))
+        mid_parts = parts[1:pivot]
+        doc_no  = mid_parts[0] if len(mid_parts) >= 1 else ""
+        ref_note= " ".join(mid_parts[1:]) if len(mid_parts) > 1 else ""
+
+        txs.append({
+            "transaction": parts[0], "doc_no": doc_no,
+            "ref_no": ref_note or ref_no, "doc_date": doc_date,
+            "drcr": drcr, "debit": debit, "credit": credit, "balance": balance,
+            "is_opening": False
+        })
+
+    return hdr, txs
+
+def excel_anco(hdr, txs):
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws.title = "Statement"; ws.sheet_properties.tabColor = C["anco_teal"]
+    for i,w in enumerate([14,10,20,14,6,16,16,18],1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    banner(ws,1,8,"ANCO TRADING LTD  |  CUSTOMER STATEMENT OF ACCOUNTS",C["anco_teal"])
+
+    lf=Font(name="Arial",bold=True,size=9); vf=Font(name="Arial",size=9)
+    lb=PatternFill("solid",start_color=C["info_bg"])
+    al=Alignment(horizontal="left",vertical="center",indent=1)
+    info=[
+        ("Customer",  hdr.get("customer",""),      "Period",        hdr.get("period","")),
+        ("Client Code",hdr.get("client_code",""),  "PIN No.",       hdr.get("pin","")),
+        ("Email",     hdr.get("email",""),          "Credit Limit",  hdr.get("credit_limit","")),
+        ("Credit Days",hdr.get("credit_days",""),  "Outstanding",
+         f"KES {hdr['total_outstanding']:,.2f}" if hdr.get("total_outstanding") else ""),
+    ]
+    for r,(l1,v1,l2,v2) in enumerate(info,start=2):
+        for ci,lbl,val in [(1,l1,v1),(5,l2,v2)]:
+            ws.merge_cells(start_row=r,start_column=ci,end_row=r,end_column=ci+1)
+            lc=ws.cell(row=r,column=ci,value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
+            vc=ws.cell(row=r,column=ci+2,value=val); vc.font=vf; vc.alignment=al
+        ws.row_dimensions[r].height=16
+
+    H=6
+    col_headers(ws,H,["Transaction","Doc No.","Ref / Note","Doc Date",
+                       "DR/CR","Debit (KES)","Credit (KES)","Balance (KES)"],C["anco_teal"])
+    D=H+1
+    for ri,tx in enumerate(txs,start=D):
+        is_open = tx.get("is_opening",False)
+        is_cr   = tx["drcr"]=="CR" and not is_open
+        is_jnl  = tx["transaction"].upper()=="JOURNAL"
+        bg = (C["info_bg"]   if is_open else
+              C["credit_row"] if is_cr and not is_jnl else
+              C["receipt_row"] if is_jnl else
+              (C["alt_row"] if (ri-D)%2==1 else None))
+        vals   = [tx["transaction"],tx["doc_no"],tx["ref_no"],tx["doc_date"],
+                  tx["drcr"],tx["debit"],tx["credit"],tx["balance"]]
+        aligns = ["center","center","left","center","center","right","right","right"]
+        fmts   = [None,None,None,None,None,MFMT,MFMT,MFMT]
+        fgs    = ["000000","000000","000000","000000",
+                  C["debit_fg"] if tx["drcr"]=="DR" else C["credit_fg"],
+                  C["debit_fg"],C["credit_fg"],"000000"]
+        for ci,(v,a,f,fg) in enumerate(zip(vals,aligns,fmts,fgs),1):
+            if ci==8 and v is not None: fg=C["neg_bal"] if v<0 else C["credit_fg"]
+            wc(ws,ri,ci,v,align=a,fmt=f,fg=fg,bg=bg,bdr=thin("bottom"))
+        ws.row_dimensions[ri].height=15
+
+    T=D+len(txs)
+    ws.merge_cells(f"A{T}:E{T}")
+    wc(ws,T,1,"TOTAL OUTSTANDING",bold=True,fg=C["col_hdr_fg"],bg=C["anco_teal"],align="right",bdr=thin(),ind=1)
+    for ci,col in [(6,"F"),(7,"G")]:
+        c=ws.cell(row=T,column=ci,value=f"=SUM({col}{D}:{col}{T-1})")
+        c.font=Font(name="Arial",bold=True,size=9,color=C["col_hdr_fg"])
+        c.fill=PatternFill("solid",start_color=C["anco_teal"])
+        c.number_format=MFMT; c.alignment=Alignment(horizontal="right",vertical="center"); c.border=thin()
+    outstanding = hdr.get("total_outstanding")
+    c=ws.cell(row=T,column=8,value=outstanding)
+    c.font=Font(name="Arial",bold=True,size=9,color=C["col_hdr_fg"])
+    c.fill=PatternFill("solid",start_color=C["anco_teal"])
+    c.number_format=MFMT; c.alignment=Alignment(horizontal="right",vertical="center"); c.border=thin()
+    ws.row_dimensions[T].height=18
+
+    # Ageing sheet
+    b=hdr.get("buckets",{})
+    if any(v is not None for v in b.values()):
+        ws2=wb.create_sheet("Ageing Summary"); ws2.sheet_properties.tabColor=C["anco_teal"]
+        for col,w in [("A",22),("B",18)]: ws2.column_dimensions[col].width=w
+        ws2.merge_cells("A1:B1")
+        wc(ws2,1,1,"AGEING ANALYSIS",bold=True,fg=C["col_hdr_fg"],bg=C["anco_teal"],align="center",sz=12)
+        ws2.row_dimensions[1].height=26
+        rows2=[("0–30 Days",b.get("0_30")),("30–60 Days",b.get("30_60")),
+               ("60–90 Days",b.get("60_90")),("<90 Days",b.get("lt90")),
+               ("Total Outstanding",hdr.get("total_outstanding"))]
+        for ri,(lbl,val) in enumerate(rows2,start=2):
+            bold=lbl=="Total Outstanding"
+            bg2=C["info_bg"] if bold else None
+            wc(ws2,ri,1,lbl,bold=bold,align="left",bdr=thin("bottom"),bg=bg2)
+            wc(ws2,ri,2,val,align="right",fmt=MFMT,bdr=thin("bottom"),
+               fg=C["neg_bal"] if (val or 0)<0 else "000000",bg=bg2)
+            ws2.row_dimensions[ri].height=16
+
+    ws.freeze_panes=f"A{D}"; ws.auto_filter.ref=f"A{H}:H{T-1}"
+    ws.page_setup.orientation="landscape"; ws.page_setup.fitToPage=True; ws.page_setup.fitToWidth=1
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN CONVERT
 # ══════════════════════════════════════════════════════════════════════════════
 def convert(pdf_bytes):
@@ -1298,6 +1705,12 @@ def convert(pdf_bytes):
     elif fmt=="autoxpress":
         hdr,txs=parse_autoxpress(lines)
         return fmt,len(txs),0,pages,excel_autoxpress(hdr,txs)
+    elif fmt=="gathani":
+        hdr,txs=parse_gathani(lines)
+        return fmt,len(txs),0,pages,excel_gathani(hdr,txs)
+    elif fmt=="anco":
+        hdr,txs=parse_anco(lines)
+        return fmt,len(txs),0,pages,excel_anco(hdr,txs)
     return "unknown",0,0,pages,None
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1315,13 +1728,15 @@ if uploaded:
 
     if fmt=="unknown":
         st.warning("⚠️ Format not recognised. Supported: Savannah Cement, National Cement, Mombasa Cement, "
-                   "Karsan Ramji, Skylife, Springtech, Scania, Trans-Solutions, AutoXpress.")
+                   "Karsan Ramji, Skylife, Springtech, Scania, Trans-Solutions, AutoXpress, "
+                   "Gathani Limited, Anco Trading Ltd.")
     else:
         labels={"savannah":"Savannah Cement","national":"National Cement",
                 "mombasa":"Mombasa Cement","karsan":"Karsan Ramji (Ndovu)",
                 "skylife":"Skylife Kenya","springtech":"Springtech (K) Ltd",
                 "scania":"Scania East Africa","transsolutions":"Trans-Solutions (E.A)",
-                "autoxpress":"AutoXpress Limited"}
+                "autoxpress":"AutoXpress Limited","gathani":"Gathani Limited",
+                "anco":"Anco Trading Ltd"}
         label=labels.get(fmt,fmt)
         chq_txt=f" · {chq_count} cheques" if chq_count else ""
         st.markdown(f"""<div class="ok">🎉 &nbsp;<b>{label}</b> converted successfully! &nbsp;·&nbsp;
