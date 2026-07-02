@@ -1,5 +1,5 @@
 import streamlit as st
-import io, re
+import io, re, json, os
 import pdfplumber
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -1713,40 +1713,587 @@ def convert(pdf_bytes):
         return fmt,len(txs),0,pages,excel_anco(hdr,txs)
     return "unknown",0,0,pages,None
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UNIVERSAL AI PARSER  (Claude — works on any supplier statement)
+# ══════════════════════════════════════════════════════════════════════════════
+import urllib.request, urllib.error
+
+# ── API key resolution (3-tier priority) ──────────────────────────────────────
+def _get_api_key() -> str | None:
+    """
+    Resolve the Anthropic API key in priority order:
+      1. Streamlit secrets  → st.secrets["ANTHROPIC_API_KEY"]
+      2. Environment var    → os.environ["ANTHROPIC_API_KEY"]
+      3. Session state      → st.session_state["_anthropic_key"] (entered via sidebar)
+    Returns None if no key is available.
+    """
+    # 1. Streamlit Cloud secrets (set via app Settings → Secrets)
+    try:
+        key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        if key: return key.strip()
+    except Exception:
+        pass
+    # 2. Local / server environment variable
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key: return key.strip()
+    # 3. User-entered key stored in session state
+    return st.session_state.get("_anthropic_key", "").strip() or None
+
+
+_AI_SYSTEM = """You are a financial document parser. Your only job is to extract data from a supplier statement PDF (provided as raw text) and return it as clean JSON.
+
+Return ONLY a single JSON object with this exact structure — no markdown, no explanation, no preamble:
+
+{
+  "supplier": "string — supplier/company name",
+  "customer": "string — customer name",
+  "statement_date": "string — as at / statement date",
+  "period": "string — date range if shown, else empty string",
+  "currency": "string — e.g. KES, USD",
+  "opening_balance": number or null,
+  "closing_balance": number or null,
+  "total_debit": number or null,
+  "total_credit": number or null,
+  "transactions": [
+    {
+      "date": "string",
+      "description": "string",
+      "reference": "string — invoice/doc/ref number",
+      "debit": number or null,
+      "credit": number or null,
+      "balance": number or null,
+      "note": "string — any extra info e.g. vehicle, LPO, type"
+    }
+  ],
+  "ageing": {
+    "0_30": number or null,
+    "31_60": number or null,
+    "61_90": number or null,
+    "91_120": number or null,
+    "above_120": number or null,
+    "total": number or null
+  },
+  "extra_fields": {}
+}
+
+Rules:
+- All monetary values must be plain numbers (no commas, no currency symbols).
+- If a field is not present in the document, use null.
+- Include EVERY line item in transactions — opening balance, invoices, receipts, credit notes, journals.
+- For debit/credit: use positive numbers. Receipts/payments go in credit; invoices go in debit.
+- If the statement has a single amount column with DR/CR indicators, split into debit or credit.
+- Dates: preserve exactly as shown in the document.
+- extra_fields: capture any columns that don't fit the standard schema.
+"""
+
+
+def _llm_extract(raw_text: str, api_key: str) -> dict:
+    """Call Claude API to extract statement data from raw PDF text."""
+    payload = json.dumps({
+        "model": "claude-sonnet-4-6",
+        "max_tokens": 4000,
+        "system": _AI_SYSTEM,
+        "messages": [{"role": "user",
+                       "content": f"Extract the statement data from this text:\n\n{raw_text[:12000]}"}]
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=payload,
+        headers={
+            "Content-Type":      "application/json",
+            "anthropic-version": "2023-06-01",
+            "x-api-key":         api_key,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        if e.code == 401:
+            raise ValueError("Invalid API key — check your Anthropic API key and try again.") from e
+        if e.code == 429:
+            raise ValueError("Rate limit reached — wait a moment and try again.") from e
+        raise ValueError(f"API error {e.code}: {body[:200]}") from e
+
+    raw = result["content"][0]["text"].strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$",       "", raw)
+    return json.loads(raw)
+
+
+def excel_universal(data: dict, filename: str) -> io.BytesIO:
+    """Write AI-extracted statement data to a clean, well-formatted Excel workbook."""
+    supplier  = data.get("supplier","Unknown Supplier") or "Unknown Supplier"
+    customer  = data.get("customer","") or ""
+    stmt_date = data.get("statement_date","") or ""
+    period    = data.get("period","") or ""
+    currency  = data.get("currency","KES") or "KES"
+    txs       = data.get("transactions") or []
+    ageing    = data.get("ageing") or {}
+
+    AI_COLOR  = "4A235A"   # deep purple — AI-mode brand colour
+    AI_LIGHT  = "F3E5F5"
+    AI_MID    = "CE93D8"
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Statement"
+    ws.sheet_properties.tabColor = AI_COLOR
+
+    # Column widths
+    col_widths = [14, 32, 20, 16, 16, 18, 28]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ── Title banner ──────────────────────────────────────────────────────────
+    ws.merge_cells("A1:G1")
+    c = ws["A1"]
+    c.value = f"{supplier.upper()}  |  CUSTOMER STATEMENT  |  ✨ AI Extracted"
+    c.font  = Font(name="Arial", bold=True, size=13, color="FFFFFF")
+    c.fill  = PatternFill("solid", start_color=AI_COLOR)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    ws.merge_cells("A2:G2")
+    c = ws["A2"]
+    c.value = f"Converted by Claude AI  ·  File: {filename}"
+    c.font  = Font(name="Arial", italic=True, size=9, color="FFFFFF")
+    c.fill  = PatternFill("solid", start_color="6A1B7A")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 16
+
+    # ── Info block ────────────────────────────────────────────────────────────
+    lf = Font(name="Arial", bold=True, size=9)
+    vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+
+    info_rows = [
+        ("Supplier",  supplier,  "Customer",       customer),
+        ("As At",     stmt_date, "Period",          period),
+        ("Currency",  currency,  "Opening Balance", _fmt_num(data.get("opening_balance"))),
+        ("Total Debit", _fmt_num(data.get("total_debit")),
+         "Total Credit", _fmt_num(data.get("total_credit"))),
+    ]
+    for r, (l1,v1,l2,v2) in enumerate(info_rows, start=3):
+        for ci,lbl,val in [(1,l1,v1),(5,l2,v2)]:
+            ws.merge_cells(start_row=r,start_column=ci,end_row=r,end_column=ci+1)
+            lc=ws.cell(row=r,column=ci,value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
+            vc=ws.cell(row=r,column=ci+2,value=val); vc.font=vf; vc.alignment=al
+        ws.row_dimensions[r].height=16
+
+    # ── Column headers ────────────────────────────────────────────────────────
+    H = 8
+    hdrs = ["Date","Description","Reference",f"Debit ({currency})",f"Credit ({currency})",f"Balance ({currency})","Note"]
+    for ci,h in enumerate(hdrs,1):
+        c=ws.cell(row=H,column=ci,value=h)
+        c.font=Font(name="Arial",bold=True,color="FFFFFF",size=10)
+        c.fill=PatternFill("solid",start_color=AI_COLOR)
+        c.alignment=Alignment(horizontal="center",vertical="center")
+        c.border=thin()
+    ws.row_dimensions[H].height=22
+
+    # ── Transaction rows ──────────────────────────────────────────────────────
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_cr  = (tx.get("credit") or 0) > 0 and not (tx.get("debit") or 0)
+        is_opn = "opening" in str(tx.get("description","")).lower() or \
+                 "balance b" in str(tx.get("description","")).lower()
+        bg = (C["info_bg"]    if is_opn else
+              C["credit_row"] if is_cr  else
+              (C["alt_row"]   if (ri-D)%2==1 else None))
+
+        vals   = [tx.get("date"), tx.get("description"), tx.get("reference"),
+                  tx.get("debit"), tx.get("credit"), tx.get("balance"), tx.get("note")]
+        aligns = ["center","left","center","right","right","right","left"]
+        fmts   = [None,None,None,MFMT,MFMT,MFMT,None]
+        fgs    = ["000000","000000","555555",
+                  C["debit_fg"], C["credit_fg"],
+                  C["neg_bal"] if (tx.get("balance") or 0)<0 else C["credit_fg"],
+                  "777777"]
+        for ci,(v,a,f,fg) in enumerate(zip(vals,aligns,fmts,fgs),1):
+            wc(ws,ri,ci,v,align=a,fmt=f,fg=fg,bg=bg,bdr=thin("bottom"))
+        ws.row_dimensions[ri].height=15
+
+    # ── Totals row ────────────────────────────────────────────────────────────
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:C{T}")
+    c=ws.cell(row=T,column=1,value="TOTALS")
+    c.font=Font(name="Arial",bold=True,size=9,color="FFFFFF")
+    c.fill=PatternFill("solid",start_color=AI_COLOR)
+    c.alignment=Alignment(horizontal="right",vertical="center",indent=1)
+    c.border=thin()
+
+    for ci,col,label in [(4,"D","debit"),(5,"E","credit")]:
+        formula = f"=SUM({col}{D}:{col}{T-1})"
+        c=ws.cell(row=T,column=ci,value=formula)
+        c.font=Font(name="Arial",bold=True,size=9,color="FFFFFF")
+        c.fill=PatternFill("solid",start_color=AI_COLOR)
+        c.number_format=MFMT
+        c.alignment=Alignment(horizontal="right",vertical="center")
+        c.border=thin()
+
+    # Closing balance in col F
+    cb=data.get("closing_balance")
+    c=ws.cell(row=T,column=6,value=cb)
+    c.font=Font(name="Arial",bold=True,size=9,color="FFFFFF")
+    c.fill=PatternFill("solid",start_color=AI_COLOR)
+    c.number_format=MFMT
+    c.alignment=Alignment(horizontal="right",vertical="center")
+    c.border=thin()
+    ws.cell(row=T,column=7).fill=PatternFill("solid",start_color=AI_COLOR)
+    ws.row_dimensions[T].height=18
+
+    ws.freeze_panes=f"A{D}"
+    ws.auto_filter.ref=f"A{H}:G{T-1}"
+    ws.page_setup.orientation="landscape"
+    ws.page_setup.fitToPage=True
+    ws.page_setup.fitToWidth=1
+
+    # ── Ageing sheet (if present) ─────────────────────────────────────────────
+    if any(v is not None for v in ageing.values()):
+        ws2=wb.create_sheet("Ageing Summary")
+        ws2.sheet_properties.tabColor=AI_COLOR
+        for col,w in [("A",24),("B",18)]: ws2.column_dimensions[col].width=w
+        ws2.merge_cells("A1:B1")
+        c=ws2["A1"]
+        c.value="AGEING SUMMARY"
+        c.font=Font(name="Arial",bold=True,size=12,color="FFFFFF")
+        c.fill=PatternFill("solid",start_color=AI_COLOR)
+        c.alignment=Alignment(horizontal="center",vertical="center")
+        ws2.row_dimensions[1].height=26
+
+        bucket_rows=[
+            ("0–30 Days",    ageing.get("0_30")),
+            ("31–60 Days",   ageing.get("31_60")),
+            ("61–90 Days",   ageing.get("61_90")),
+            ("91–120 Days",  ageing.get("91_120")),
+            ("Above 120 Days",ageing.get("above_120")),
+            ("Total Outstanding", ageing.get("total") or data.get("closing_balance")),
+        ]
+        for ri,(lbl,val) in enumerate(bucket_rows,start=2):
+            bold=lbl.startswith("Total")
+            bg2=PatternFill("solid",start_color=C["info_bg"]) if bold else None
+            lc=ws2.cell(row=ri,column=1,value=lbl)
+            lc.font=Font(name="Arial",bold=bold,size=9)
+            if bg2: lc.fill=bg2
+            lc.border=thin("bottom")
+            vc=ws2.cell(row=ri,column=2,value=val)
+            vc.font=Font(name="Arial",bold=bold,size=9,
+                         color=C["neg_bal"] if (val or 0)<0 else "000000")
+            vc.number_format=MFMT
+            vc.alignment=Alignment(horizontal="right",vertical="center")
+            if bg2: vc.fill=bg2
+            vc.border=thin("bottom")
+            ws2.row_dimensions[ri].height=16
+
+    # ── AI Confidence sheet ───────────────────────────────────────────────────
+    ws3=wb.create_sheet("AI Extraction Info")
+    ws3.sheet_properties.tabColor="AB47BC"
+    ws3.column_dimensions["A"].width=28
+    ws3.column_dimensions["B"].width=50
+
+    ws3.merge_cells("A1:B1")
+    c=ws3["A1"]
+    c.value="AI EXTRACTION DETAILS"
+    c.font=Font(name="Arial",bold=True,size=11,color="FFFFFF")
+    c.fill=PatternFill("solid",start_color=AI_COLOR)
+    c.alignment=Alignment(horizontal="center",vertical="center")
+    ws3.row_dimensions[1].height=24
+
+    meta=[
+        ("Model Used","claude-sonnet-4-6"),
+        ("Extraction Method","Universal AI (no template required)"),
+        ("Transactions Found",str(len(txs))),
+        ("Supplier Detected",supplier),
+        ("Customer Detected",customer),
+        ("Statement Date",stmt_date),
+        ("Currency",currency),
+        ("",""),
+        ("⚠️ Tip","Always verify key figures (totals, closing balance) against the original PDF"),
+        ("✅ Accuracy","Monetary values are extracted exactly as shown in the source document"),
+        ("🔒 Privacy","PDF text is sent to Claude API for processing — do not upload confidential statements"),
+    ]
+    for ri,(lbl,val) in enumerate(meta,start=2):
+        lc=ws3.cell(row=ri,column=1,value=lbl)
+        lc.font=Font(name="Arial",bold=True,size=9)
+        lc.fill=PatternFill("solid",start_color=C["info_bg"])
+        lc.alignment=Alignment(horizontal="left",vertical="center",indent=1)
+        lc.border=thin("bottom")
+        vc=ws3.cell(row=ri,column=2,value=val)
+        vc.font=Font(name="Arial",size=9)
+        vc.alignment=Alignment(horizontal="left",vertical="center",indent=1)
+        vc.border=thin("bottom")
+        ws3.row_dimensions[ri].height=16
+
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+
+def _fmt_num(v):
+    if v is None: return ""
+    try: return f"{float(v):,.2f}"
+    except: return str(v)
+
+
+def convert_ai(pdf_bytes: bytes, filename: str, api_key: str):
+    """Full AI conversion pipeline: extract text → LLM → Excel."""
+    lines=[]
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        pages=len(pdf.pages)
+        for page in pdf.pages:
+            t=page.extract_text()
+            if t: lines.extend(t.split("\n"))
+    raw_text="\n".join(lines)
+    data=_llm_extract(raw_text, api_key)
+    txs=data.get("transactions") or []
+    buf=excel_universal(data, filename)
+    return "ai", len(txs), 0, pages, buf, data.get("supplier","Unknown")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
-uploaded=st.file_uploader("Drop your PDF here",type=["pdf","PDF"],label_visibility="collapsed")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Extra CSS ─────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+.ai-banner{
+  background:linear-gradient(120deg,#6a1b9a,#4a148c,#1a237e);
+  background-size:200% 200%;animation:gradientshift 6s ease infinite;
+  border-radius:18px;padding:20px 24px;color:white;margin:14px 0;
+  box-shadow:0 10px 28px -8px rgba(106,27,154,.55);
+}
+.ai-banner h3{margin:0 0 6px;font-size:1.2rem;font-weight:800}
+.ai-banner p{margin:0;font-size:.9rem;opacity:.9}
+.ai-ok{
+  background:linear-gradient(120deg,#ede7f6,#e8eaf6);
+  border:1.5px solid #9c27b0;border-radius:16px;
+  padding:18px 22px;color:#4a148c;font-weight:600;
+  margin-top:14px;box-shadow:0 6px 18px -8px rgba(156,39,176,.3);
+}
+.key-box{
+  background:#fafafa;border:1.5px solid #e0e0e0;border-radius:12px;
+  padding:14px 16px;margin:10px 0;font-size:.85rem;color:#444;
+}
+.key-ok  {border-color:#43a047;background:#f1f8e9;color:#2e7d32}
+.key-warn{border-color:#fb8c00;background:#fff8e1;color:#e65100}
+</style>
+""", unsafe_allow_html=True)
+
+# ── Sidebar — API key configuration ──────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## ⚙️ Settings")
+    st.markdown("---")
+    st.markdown("### 🤖 AI Mode — API Key")
+    st.markdown(
+        "AI Mode uses the **Claude API**. "
+        "The key is resolved in this order:\n"
+        "1. Streamlit Cloud **Secrets** (`ANTHROPIC_API_KEY`)\n"
+        "2. Environment variable `ANTHROPIC_API_KEY`\n"
+        "3. Entered below (session only — not stored)"
+    )
+
+    # Check if key already available via secrets / env
+    _auto_key = ""
+    try:
+        _auto_key = st.secrets.get("ANTHROPIC_API_KEY","") or ""
+    except Exception:
+        pass
+    if not _auto_key:
+        _auto_key = os.environ.get("ANTHROPIC_API_KEY","")
+
+    if _auto_key:
+        masked = _auto_key[:8] + "••••••••" + _auto_key[-4:]
+        st.markdown(f'<div class="key-box key-ok">✅ API key loaded automatically<br><code>{masked}</code></div>',
+                    unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="key-box key-warn">⚠️ No key found in secrets/env — enter below for this session</div>',
+                    unsafe_allow_html=True)
+        manual_key = st.text_input(
+            "Anthropic API Key",
+            type="password",
+            placeholder="sk-ant-api03-...",
+            help="Get your key at console.anthropic.com — it is used only for this session and never stored.",
+            key="manual_api_key_input",
+        )
+        if manual_key:
+            st.session_state["_anthropic_key"] = manual_key
+            st.success("Key saved for this session ✅")
+
+    st.markdown("---")
+    st.markdown("### 📖 How to add a permanent key")
+    with st.expander("Streamlit Cloud (recommended)"):
+        st.markdown("""
+1. Open your app in Streamlit Cloud
+2. Go to **Settings → Secrets**
+3. Add:
+```toml
+ANTHROPIC_API_KEY = "sk-ant-api03-..."
+```
+4. Save — your app will restart with the key available
+        """)
+    with st.expander("Local / Anaconda"):
+        st.markdown("""
+Set the environment variable before running:
+```bash
+# Windows (Anaconda Prompt)
+set ANTHROPIC_API_KEY=sk-ant-api03-...
+streamlit run app.py
+
+# Mac / Linux
+export ANTHROPIC_API_KEY=sk-ant-api03-...
+streamlit run app.py
+```
+Or add it permanently to your conda environment:
+```bash
+conda env config vars set ANTHROPIC_API_KEY=sk-ant-api03-...
+conda activate dswork
+```
+        """)
+    with st.expander("Get an API key"):
+        st.markdown("""
+1. Go to **console.anthropic.com**
+2. Sign in / create an account
+3. Navigate to **API Keys**
+4. Click **Create Key** — copy and save it securely
+        """)
+
+    st.markdown("---")
+    st.caption("Statement PDF → Excel · Files never stored")
+
+
+# ── Mode selector ─────────────────────────────────────────────────────────────
+mode = st.radio(
+    "Conversion mode:",
+    ["🔵  Rule-Based  (fast · free · known suppliers)",
+     "🤖  AI Mode  (any supplier · requires API key)"],
+    horizontal=True,
+)
+use_ai = mode.startswith("🤖")
+
+if use_ai:
+    # Resolve key early so we can warn before upload
+    api_key = _get_api_key()
+    if not api_key:
+        st.markdown("""
+<div class="ai-banner">
+  <h3>🔑 API Key Required</h3>
+  <p>AI Mode needs an Anthropic API key. Enter it in the <b>sidebar → AI Mode — API Key</b>,
+  or add it to Streamlit Secrets / your environment variable.<br>
+  No key? Get one free at <b>console.anthropic.com</b></p>
+</div>""", unsafe_allow_html=True)
+    else:
+        st.markdown("""
+<div class="ai-banner">
+  <h3>🤖 AI Universal Parser — powered by Claude</h3>
+  <p>Upload <b>any</b> supplier statement PDF. Claude reads the document, understands its
+  structure, and extracts all transactions into a formatted Excel — no template required.</p>
+  <p style="margin-top:8px;font-size:.8rem;opacity:.75">
+  ⚠️ PDF text is sent to the Claude API &nbsp;·&nbsp;
+  Do not upload confidential documents &nbsp;·&nbsp;
+  Always verify totals against the original PDF</p>
+</div>""", unsafe_allow_html=True)
+else:
+    api_key = None
+
+# ── File uploader ─────────────────────────────────────────────────────────────
+uploaded = st.file_uploader(
+    "Drop your PDF here",
+    type=["pdf","PDF"],
+    label_visibility="collapsed",
+    key="pdf_upload",
+)
 
 if uploaded:
     st.markdown(f"📎 **Uploaded:** `{uploaded.name}` &nbsp;({uploaded.size/1024:.1f} KB)")
-    with st.spinner("✨ Converting your statement…"):
-        try:
-            fmt,tx_count,chq_count,pages,buf=convert(uploaded.read())
-        except Exception as e:
-            st.error(f"❌ Error: {e}"); st.stop()
+    pdf_bytes = uploaded.read()
 
-    if fmt=="unknown":
-        st.warning("⚠️ Format not recognised. Supported: Savannah Cement, National Cement, Mombasa Cement, "
-                   "Karsan Ramji, Skylife, Springtech, Scania, Trans-Solutions, AutoXpress, "
-                   "Gathani Limited, Anco Trading Ltd.")
+    # ── AI MODE ───────────────────────────────────────────────────────────────
+    if use_ai:
+        api_key = _get_api_key()   # re-resolve in case user just entered it
+        if not api_key:
+            st.error("❌ No API key found. Enter your Anthropic API key in the sidebar first.")
+            st.stop()
+
+        with st.spinner("🤖 Claude is reading your statement… (10–20 seconds)"):
+            try:
+                fmt,tx_count,_,pages,buf,supplier = convert_ai(pdf_bytes, uploaded.name, api_key)
+            except ValueError as e:
+                st.error(f"❌ {e}")
+                st.stop()
+            except json.JSONDecodeError as e:
+                st.error(f"❌ AI returned unexpected output: {e}. Try again.")
+                st.stop()
+            except Exception as e:
+                st.error(f"❌ Unexpected error: {e}")
+                st.stop()
+
+        st.markdown(f"""<div class="ai-ok">
+        🤖 &nbsp;<b>AI extracted successfully!</b> &nbsp;·&nbsp;
+        📄 {pages} page(s) &nbsp;·&nbsp;
+        🧾 {tx_count} transactions &nbsp;·&nbsp;
+        🏢 {supplier}
+        </div>""", unsafe_allow_html=True)
+        st.caption("✅ Check the **AI Extraction Info** sheet in the Excel file for verification tips.")
+        st.write("")
+        st.download_button(
+            "⬇️  Download AI-Extracted Excel",
+            data=buf,
+            file_name=Path(uploaded.name).stem+"_AI_extracted.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    # ── RULE-BASED MODE ───────────────────────────────────────────────────────
     else:
-        labels={"savannah":"Savannah Cement","national":"National Cement",
+        with st.spinner("✨ Converting your statement…"):
+            try:
+                fmt,tx_count,chq_count,pages,buf = convert(pdf_bytes)
+            except Exception as e:
+                st.error(f"❌ Error: {e}"); st.stop()
+
+        if fmt == "unknown":
+            st.warning("⚠️ Format not recognised by rule-based parser.")
+            st.markdown("""
+<div class="ai-banner" style="margin-top:12px">
+  <h3>💡 Try AI Mode</h3>
+  <p>Select <b>🤖 AI Mode</b> in the mode selector above and re-upload your PDF.
+  Claude will automatically read and extract any statement format — no setup needed.</p>
+</div>""", unsafe_allow_html=True)
+        else:
+            labels = {
+                "savannah":"Savannah Cement","national":"National Cement",
                 "mombasa":"Mombasa Cement","karsan":"Karsan Ramji (Ndovu)",
                 "skylife":"Skylife Kenya","springtech":"Springtech (K) Ltd",
                 "scania":"Scania East Africa","transsolutions":"Trans-Solutions (E.A)",
                 "autoxpress":"AutoXpress Limited","gathani":"Gathani Limited",
-                "anco":"Anco Trading Ltd"}
-        label=labels.get(fmt,fmt)
-        chq_txt=f" · {chq_count} cheques" if chq_count else ""
-        st.markdown(f"""<div class="ok">🎉 &nbsp;<b>{label}</b> converted successfully! &nbsp;·&nbsp;
-        📄 {pages} page(s) &nbsp;·&nbsp; 🧾 {tx_count} transactions{chq_txt}</div>""",
-        unsafe_allow_html=True)
-        st.write("")
-        st.download_button("⬇️  Download Excel File",data=buf,
-            file_name=Path(uploaded.name).stem+"_converted.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                "anco":"Anco Trading Ltd",
+            }
+            label   = labels.get(fmt, fmt)
+            chq_txt = f" · {chq_count} cheques" if chq_count else ""
+            st.markdown(
+                f"""<div class="ok">🎉 &nbsp;<b>{label}</b> converted successfully! &nbsp;·&nbsp;
+                📄 {pages} page(s) &nbsp;·&nbsp; 🧾 {tx_count} transactions{chq_txt}</div>""",
+                unsafe_allow_html=True,
+            )
+            st.write("")
+            st.download_button(
+                "⬇️  Download Excel File",
+                data=buf,
+                file_name=Path(uploaded.name).stem+"_converted.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
 st.markdown("---")
-st.markdown('<div class="footer-note">✨ Files processed in memory · never stored · free to use ✨</div>',
-            unsafe_allow_html=True)
+st.markdown(
+    '<div class="footer-note">✨ Files processed in memory · never stored · free to use ✨</div>',
+    unsafe_allow_html=True,
+)
