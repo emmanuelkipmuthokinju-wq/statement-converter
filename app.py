@@ -86,6 +86,11 @@ st.markdown("""
   <span class="badge">🔵 National Cement</span>
   <span class="badge">🟢 Mombasa Cement</span>
   <span class="badge">🟣 Karsan Ramji</span>
+  <span class="badge">🟦 Skylife</span>
+  <span class="badge">🟪 Springtech</span>
+  <span class="badge">🔴 Scania</span>
+  <span class="badge">🟩 Trans-Solutions</span>
+  <span class="badge">🟧 AutoXpress</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
 """, unsafe_allow_html=True)
@@ -98,6 +103,11 @@ with st.expander("🎨 Supported formats"):
 | 🔵 **National Cement** | Date · Description · Vehicle · LPO · Qty · Invoice · CU Invoice · Location · Debit · Credit · Balance + Cheques sheet |
 | 🟢 **Mombasa Cement** | Doc Date · Reference · Cheque No · Description · Amount · Balance |
 | 🟣 **Karsan Ramji (Ndovu)** | Date · Doc No · BP Ref · CU Invoice · Line Memo · Debit · Credit · Balance |
+| 🟦 **Skylife Kenya** | Tally-style ledger: Date · Particulars · Vch No · Debit · Credit · Running Balance |
+| 🟪 **Springtech (K) Ltd** | Date · Transaction · Amount · Balance + Ageing Summary sheet |
+| 🔴 **Scania East Africa** | Date · Invoice · Description · Due Date · Debit · Credit · Balance |
+| 🟩 **Trans-Solutions (E.A)** | Date · Transaction · Amount · Balance + Ageing Summary sheet |
+| 🟧 **AutoXpress** | Date · Tax Invoice · GP Invoice · LPO · Opening Bal · Invoice · Payment · Cummulative + Ageing Summary sheet |
     """)
 
 # ── Colours & helpers ──────────────────────────────────────────────────────────
@@ -105,8 +115,24 @@ C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20
          karsan_purple="4A148C", header_dark="2C3E50", col_hdr_fg="FFFFFF",
          alt_row="F2F6FA", credit_row="E8F5E9", receipt_row="FFF3E0",
          info_bg="ECF0F1", debit_fg="1565C0", credit_fg="2E7D32",
-         neg_bal="C62828", border="BDBDBD")
+         neg_bal="C62828", border="BDBDBD",
+         skylife_teal="00838F", springtech_indigo="3F51B5", scania_red="C8102E",
+         transsolutions_cyan="0097A7", autoxpress_amber="F57C00")
 MFMT = '#,##0.00;(#,##0.00);"-"'
+IFMT = '#,##0;(#,##0);"-"'
+
+def pnf(s):
+    """General money parser: handles leading/trailing '-', commas, currency prefixes."""
+    if s is None: return None
+    s = str(s).strip()
+    if not s: return None
+    neg = False
+    if s.startswith("-"): neg = True; s = s[1:]
+    if s.endswith("-"): neg = True; s = s[:-1]
+    s = s.replace(",", "").replace("KES", "").replace("KShs", "").strip()
+    try: v = float(s)
+    except: return None
+    return -v if neg else v
 
 def thin(sides="all"):
     s = Side(style="thin", color=C["border"])
@@ -149,6 +175,12 @@ def totals_row(ws, row, merge_end, label_text, data_cols, bg):
 # ── FORMAT DETECTION ───────────────────────────────────────────────────────────
 def detect(lines):
     t = "\n".join(lines[:50])
+    tfull = "\n".join(lines[:150])
+    if "SKYLIFE" in t.upper():                                        return "skylife"
+    if "SPRINGTECH" in t.upper():                                      return "springtech"
+    if "TRANS-SOLUTIONS" in t.upper() or "TRANSSOLUTIONS" in t.upper(): return "transsolutions"
+    if "AUTOXPRESS" in t.upper() or "AUTO XPRESS" in t.upper():        return "autoxpress"
+    if "SCANIA" in tfull.upper():                                      return "scania"
     if "MOMBASA CEMENT" in t.upper():                                  return "mombasa"
     if "Karsan Ramji" in t or "NDOVU" in t.upper() or "BP REF" in t:  return "karsan"
     if "NATIONAL CEMENT" in t.upper() or "CU Invoice Number" in t:    return "national"
@@ -712,6 +744,521 @@ def excel_savannah(hdr,txs):
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SKYLIFE KENYA LIMITED PARSER  (Tally-style ledger: To/By, Vch Type, Vch No.)
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_SKY = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{2}$")
+MONEY_SKY = re.compile(r"^[\d,]+\.\d{2}$")
+VCHNO_SKY = re.compile(r"^[A-Z0-9]{6,}$")
+SKIP_SKY = ("Skylife Kenya Limited", "P.O.Box No.", "Nairobi, Kenya",
+            "NEW MUTHOKINJU HARDWARE LTD", "Ledger Account", "Page", "continued",
+            "Date Particulars")
+
+def parse_skylife(lines):
+    hdr = {"supplier": "Skylife Kenya Limited", "customer": "New Muthokinju Hardware Ltd",
+           "period": "", "closing_balance": None}
+    for ln in lines[:10]:
+        m = re.search(r"^(\d{1,2}-[A-Za-z]{3}-\d{2})\s+to\s+(\d{1,2}-[A-Za-z]{3}-\d{2})$", ln.strip())
+        if m: hdr["period"] = f"{m.group(1)} to {m.group(2)}"
+
+    txs = []; current_date = ""
+    for ln in lines:
+        ln = ln.strip()
+        if not ln: continue
+        if any(s in ln for s in SKIP_SKY): continue
+        if "Carried Over" in ln or "Brought Forward" in ln: continue
+        if re.match(r"^[\d,]+\.\d{2}\s+[\d,]+\.\d{2}$", ln): continue  # subtotal/grand-total lines
+
+        parts = ln.split()
+        if not parts: continue
+
+        if "Closing Balance" in ln:
+            m = re.search(r"([\d,]+\.\d{2})$", ln)
+            if m: hdr["closing_balance"] = pnf(m.group(1))
+            continue
+
+        if DATE_SKY.match(parts[0]):
+            current_date = parts[0]; rest = parts[1:]
+        else:
+            rest = parts  # continuation row, same date as previous
+
+        if not rest or rest[0] not in ("To", "By"): continue
+        side = "Debit" if rest[0] == "To" else "Credit"
+        body = rest[1:]
+        if not body or not MONEY_SKY.match(body[-1]): continue
+        amount = pnf(body[-1])
+        remainder = body[:-1]
+
+        vch_no = ""
+        if remainder and VCHNO_SKY.match(remainder[-1]) and any(ch.isdigit() for ch in remainder[-1]):
+            vch_no = remainder.pop()
+
+        particulars = " ".join(remainder).strip() or "—"
+        txs.append({"date": current_date, "particulars": particulars, "vch_no": vch_no,
+                    "debit": amount if side == "Debit" else None,
+                    "credit": amount if side == "Credit" else None})
+    return hdr, txs
+
+def excel_skylife(hdr, txs):
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
+    ws.sheet_properties.tabColor = C["skylife_teal"]
+    for i, w in enumerate([12, 40, 22, 16, 16, 18], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    banner(ws, 1, 6, "SKYLIFE KENYA LIMITED  |  LEDGER ACCOUNT STATEMENT", C["skylife_teal"])
+
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [("Customer", hdr.get("customer", ""), "Supplier", hdr.get("supplier", "")),
+            ("Period", hdr.get("period", ""), "Currency", "KES")]
+    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
+        for ci, lbl, val in [(1, l1, v1), (4, l2, v2)]:
+            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci)
+            ws.merge_cells(start_row=r, start_column=ci+1, end_row=r, end_column=ci+2 if ci==4 else ci+2)
+            lc = ws.cell(row=r, column=ci, value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
+            vc = ws.cell(row=r, column=ci+1, value=val); vc.font=vf; vc.alignment=al
+        ws.row_dimensions[r].height = 16
+
+    H = 4
+    col_headers(ws, H, ["Date", "Particulars", "Vch No.", "Debit (KES)", "Credit (KES)", "Running Balance (KES)"],
+                C["skylife_teal"])
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_open = "Opening Balance" in tx["particulars"]
+        bg = C["info_bg"] if is_open else (C["credit_row"] if tx["credit"] else (C["alt_row"] if (ri-D) % 2 == 1 else None))
+        if ri == D:
+            bal_formula = tx["debit"] or 0
+            c = ws.cell(row=ri, column=6, value=bal_formula)
+        else:
+            c = ws.cell(row=ri, column=6, value=f"=F{ri-1}+D{ri}-E{ri}")
+        c.number_format = MFMT; c.font = Font(name="Arial", size=9); c.alignment = Alignment(horizontal="right", vertical="center")
+        c.border = thin("bottom")
+        vals = [tx["date"], tx["particulars"], tx["vch_no"], tx["debit"], tx["credit"]]
+        aligns = ["center", "left", "center", "right", "right"]
+        fmts = [None, None, None, MFMT, MFMT]
+        fgs = ["000000", "000000", "000000", C["debit_fg"], C["credit_fg"]]
+        for ci, (v, a, f, fg) in enumerate(zip(vals, aligns, fmts, fgs), 1):
+            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
+        ws.row_dimensions[ri].height = 15
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:C{T}")
+    wc(ws, T, 1, "TOTAL", bold=True, fg=C["col_hdr_fg"], bg=C["header_dark"], align="right", bdr=thin(), ind=1)
+    for ci, col in [(4, "D"), (5, "E")]:
+        c = ws.cell(row=T, column=ci, value=f"=SUM({col}{D}:{col}{T-1})")
+        c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+        c.fill = PatternFill("solid", start_color=C["header_dark"])
+        c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    cb = hdr.get("closing_balance")
+    c = ws.cell(row=T, column=6, value=cb if cb is not None else "")
+    c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+    c.fill = PatternFill("solid", start_color=C["header_dark"])
+    c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    ws.row_dimensions[T].height = 18
+    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:F{T-1}"
+    ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GENERIC "AGING STATEMENT" PARSER  (used by Springtech and Trans-Solutions —
+# both use: Date | Transaction | Amount | Balance + an ageing bucket summary)
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_AG = re.compile(r"^\d{2}[-/]\d{2}[-/]\d{4}$")
+MONEY_AG = re.compile(r"^-?[\d,]+\.\d{2}$")
+
+def parse_aging_rows(lines):
+    txs = []
+    for ln in lines:
+        ln = ln.strip()
+        parts = ln.split()
+        if not parts or not DATE_AG.match(parts[0]): continue
+        rest = parts[1:]
+        if not rest: continue
+        money_idxs = [i for i, x in enumerate(rest) if MONEY_AG.match(x)]
+        if len(money_idxs) >= 2:
+            a_idx, b_idx = money_idxs[-2], money_idxs[-1]
+            desc = " ".join(rest[:a_idx])
+            amount = pnf(rest[a_idx]); balance = pnf(rest[b_idx])
+        elif len(money_idxs) == 1:
+            desc = " ".join(rest[:money_idxs[0]])
+            amount = None; balance = pnf(rest[money_idxs[0]])
+        else:
+            continue
+        txs.append({"date": parts[0], "description": desc.strip() or "—",
+                    "amount": amount, "balance": balance})
+    return txs
+
+def parse_aging_summary(full_text):
+    m = re.search(r"(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+"
+                   r"(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})", full_text)
+    buckets = {"current": None, "d1_30": None, "d31_60": None, "d61_90": None, "over90": None}
+    if m:
+        buckets = {"current": pnf(m.group(1)), "d1_30": pnf(m.group(2)), "d31_60": pnf(m.group(3)),
+                   "d61_90": pnf(m.group(4)), "over90": pnf(m.group(5))}
+    amt = None
+    m2 = re.search(r"Amount Due[^\d\-]*(-?(?:KES|KShs)?\s*[\d,]+\.\d{2})", full_text)
+    if m2: amt = pnf(m2.group(1))
+    return buckets, amt
+
+def parse_springtech(lines):
+    hdr = {"supplier": "Springtech (K) Ltd", "address": "P.O. Box 94089 - 80107, Mombasa, Kenya",
+           "customer": "New Muthokinju Hardware Ltd", "currency": "KES"}
+    full = "\n".join(lines)
+    hdr["buckets"], hdr["amount_due"] = parse_aging_summary(full)
+    m = re.search(r"Date\s*\n?\s*(\d{2}-\d{2}-\d{4})", full)
+    if m: hdr["statement_date"] = m.group(1)
+    return hdr, parse_aging_rows(lines)
+
+def parse_transsolutions(lines):
+    hdr = {"supplier": "Trans-Solutions (E.A) Ltd", "address": "P.O.Box 17634, Kenya 00500",
+           "customer": "New Muthokinju Hardware Limited", "currency": "KES"}
+    full = "\n".join(lines)
+    hdr["buckets"], hdr["amount_due"] = parse_aging_summary(full)
+    m = re.search(r"(\d{2}/\d{2}/\d{4})", full)
+    if m: hdr["statement_date"] = m.group(1)
+    m = re.search(r"PAYBILL NO:\s*([\d\s]+)", full)
+    if m: hdr["paybill"] = re.sub(r"\s+", "", m.group(1))
+    return hdr, parse_aging_rows(lines)
+
+def excel_aging_statement(hdr, txs, tab_color, banner_text):
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
+    ws.sheet_properties.tabColor = tab_color
+    for i, w in enumerate([14, 46, 16, 16], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    banner(ws, 1, 4, banner_text, tab_color)
+
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [("Customer", hdr.get("customer", ""), "Statement Date", hdr.get("statement_date", "")),
+            ("Supplier", hdr.get("supplier", ""), "Currency", hdr.get("currency", "KES"))]
+    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=1)
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=2)
+        ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=3)
+        ws.merge_cells(start_row=r, start_column=4, end_row=r, end_column=4)
+        lc = ws.cell(row=r, column=1, value=l1); lc.font=lf; lc.fill=lb; lc.alignment=al
+        vc = ws.cell(row=r, column=2, value=v1); vc.font=vf; vc.alignment=al
+        lc2 = ws.cell(row=r, column=3, value=l2); lc2.font=lf; lc2.fill=lb; lc2.alignment=al
+        vc2 = ws.cell(row=r, column=4, value=v2); vc2.font=vf; vc2.alignment=al
+        ws.row_dimensions[r].height = 16
+
+    H = 5
+    col_headers(ws, H, ["Date", "Transaction", "Amount (KES)", "Balance (KES)"], tab_color)
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_bf = "Balance forward" in tx["description"]
+        is_credit = tx["amount"] is not None and tx["amount"] < 0
+        bg = C["info_bg"] if is_bf else (C["credit_row"] if is_credit else (C["alt_row"] if (ri-D) % 2 == 1 else None))
+        vals = [tx["date"], tx["description"], tx["amount"], tx["balance"]]
+        aligns = ["center", "left", "right", "right"]
+        fmts = [None, None, MFMT, MFMT]
+        for ci, (v, a, f) in enumerate(zip(vals, aligns, fmts), 1):
+            fg = "000000"
+            if ci == 3 and v is not None: fg = C["credit_fg"] if v < 0 else C["debit_fg"]
+            if ci == 4 and v is not None: fg = C["neg_bal"] if v < 0 else "000000"
+            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
+        ws.row_dimensions[ri].height = 15
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:B{T}")
+    wc(ws, T, 1, "CLOSING BALANCE", bold=True, fg=C["col_hdr_fg"], bg=tab_color, align="right", bdr=thin(), ind=1)
+    c = ws.cell(row=T, column=3, value="")
+    c.fill = PatternFill("solid", start_color=tab_color); c.border = thin()
+    last_bal = txs[-1]["balance"] if txs else None
+    c = ws.cell(row=T, column=4, value=last_bal)
+    c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+    c.fill = PatternFill("solid", start_color=tab_color)
+    c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    ws.row_dimensions[T].height = 18
+    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:D{T-1}"
+    ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
+
+    # Ageing summary sheet
+    b = hdr.get("buckets") or {}
+    if any(v is not None for v in b.values()) or hdr.get("amount_due") is not None:
+        ws2 = wb.create_sheet("Ageing Summary"); ws2.sheet_properties.tabColor = tab_color
+        for col, w in [("A", 20), ("B", 18)]: ws2.column_dimensions[col].width = w
+        ws2.merge_cells("A1:B1")
+        wc(ws2, 1, 1, "AGEING SUMMARY", bold=True, fg=C["col_hdr_fg"], bg=tab_color, align="center", sz=12)
+        ws2.row_dimensions[1].height = 26
+        rows2 = [("Current", b.get("current")), ("1–30 Days Past Due", b.get("d1_30")),
+                 ("31–60 Days Past Due", b.get("d31_60")), ("61–90 Days Past Due", b.get("d61_90")),
+                 ("Over 90 Days Past Due", b.get("over90")), ("Amount Due", hdr.get("amount_due"))]
+        for ri, (lbl, val) in enumerate(rows2, start=2):
+            bold = lbl == "Amount Due"
+            wc(ws2, ri, 1, lbl, bold=bold, align="left", bdr=thin("bottom"), bg=C["info_bg"] if bold else None)
+            wc(ws2, ri, 2, val, align="right", fmt=MFMT, bdr=thin("bottom"),
+               fg=C["neg_bal"] if (val or 0) < 0 else "000000", bg=C["info_bg"] if bold else None)
+            ws2.row_dimensions[ri].height = 16
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCANIA EAST AFRICA LIMITED PARSER
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_SC = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+MONEY_SC = re.compile(r"^-?[\d,]+\.\d{2}$")
+SKIP_SC = ("Scania East Africa", "VAT Registration", "Mombasa Rd", "P.O.Box", "Nairobi",
+           "Nakuru", "Eldoret", "Account statement", "Page Page", "Date and time", "Phone",
+           "Fax", "BACS/CHAPS", "Tax registration number", "Customer account",
+           "Terms of payment", "Currency", "From date", "To date", "New Muthokinju",
+           "P O Box", "Bonje", "Harvester Road", "Tairi Mbili", "Date Invoice Description",
+           "+254")
+
+def parse_scania_row(toks):
+    if toks[0] in ("Opening", "Closing"):
+        try: kes_idx = toks.index("KES")
+        except ValueError: kes_idx = None
+        bal = pnf(toks[kes_idx+1]) if kes_idx is not None and kes_idx+1 < len(toks) else None
+        return {"label": toks[0], "date": "", "invoice": "", "description": "", "due_date": "",
+                "debit": None, "credit": None, "balance": bal, "is_summary": True}
+    date = toks[0]
+    invoice = toks[1] if len(toks) > 1 else ""
+    try: kes_idx = toks.index("KES")
+    except ValueError: kes_idx = len(toks)
+    date_positions = [j for j in range(2, kes_idx) if DATE_SC.match(toks[j])]
+    due_idx = date_positions[-1] if date_positions else None
+    if due_idx is not None:
+        due_date = toks[due_idx]; desc = " ".join(toks[2:due_idx])
+    else:
+        due_date = ""; desc = " ".join(toks[2:kes_idx])
+    money = toks[kes_idx+1:]
+    debit = pnf(money[0]) if len(money) > 0 else None
+    credit = pnf(money[1]) if len(money) > 1 else None
+    balance = pnf(money[2]) if len(money) > 2 else None
+    return {"label": "", "date": date, "invoice": invoice, "description": desc, "due_date": due_date,
+            "debit": debit, "credit": credit, "balance": balance, "is_summary": False}
+
+def parse_scania(lines):
+    hdr = {"customer": "New Muthokinju", "account": "", "terms": "", "currency": "KES",
+           "from_date": "", "to_date": "", "tax_reg": ""}
+    for ln in lines:
+        m = re.search(r"Customer account\s+(\d+)", ln)
+        if m: hdr["account"] = m.group(1)
+        m = re.search(r"Terms of payment\s+(\d+\s+days\s+net)", ln)
+        if m: hdr["terms"] = m.group(1)
+        m = re.search(r"From date\s+([\d/]+)", ln)
+        if m: hdr["from_date"] = m.group(1)
+        m = re.search(r"To date\s+([\d/]+)", ln)
+        if m: hdr["to_date"] = m.group(1)
+        m = re.search(r"Tax registration number\s+(\S+)", ln)
+        if m: hdr["tax_reg"] = m.group(1)
+
+    raw = [l.strip() for l in lines if l.strip()]
+    txs = []; i = 0
+    while i < len(raw):
+        toks = raw[i].split()
+        if not toks or not (DATE_SC.match(toks[0]) or toks[0] in ("Opening", "Closing")):
+            i += 1; continue
+        buf = toks[:]
+        while "KES" not in buf and i+1 < len(raw):
+            i += 1; buf.extend(raw[i].split())
+        tx = parse_scania_row(buf)
+        if i+1 < len(raw):
+            nxt = raw[i+1]; ntoks = nxt.split()
+            if (ntoks and not (DATE_SC.match(ntoks[0]) or ntoks[0] in ("Opening", "Closing"))
+                    and not any(k in nxt for k in SKIP_SC) and not MONEY_SC.match(ntoks[0])):
+                if not tx["is_summary"]:
+                    tx["description"] = (tx["description"] + " " + nxt).strip()
+                i += 1
+        txs.append(tx); i += 1
+    return hdr, txs
+
+def excel_scania(hdr, txs):
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
+    ws.sheet_properties.tabColor = C["scania_red"]
+    for i, w in enumerate([14, 16, 24, 14, 16, 16, 18], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    banner(ws, 1, 7, "SCANIA EAST AFRICA LIMITED  |  ACCOUNT STATEMENT", C["scania_red"])
+
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [("Customer", hdr.get("customer", ""), "Account No.", hdr.get("account", "")),
+            ("Terms", hdr.get("terms", ""), "Tax Reg.", hdr.get("tax_reg", "")),
+            ("From Date", hdr.get("from_date", ""), "To Date", hdr.get("to_date", ""))]
+    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
+        for ci, lbl, val in [(1, l1, v1), (4, l2, v2)]:
+            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci)
+            ws.merge_cells(start_row=r, start_column=ci+1, end_row=r, end_column=ci+2)
+            lc = ws.cell(row=r, column=ci, value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
+            vc = ws.cell(row=r, column=ci+1, value=val); vc.font=vf; vc.alignment=al
+        ws.row_dimensions[r].height = 16
+
+    H = 5
+    col_headers(ws, H, ["Date", "Invoice", "Description", "Due Date", "Debit (KES)", "Credit (KES)", "Balance (KES)"],
+                C["scania_red"])
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_sum = tx["is_summary"]
+        bg = C["info_bg"] if is_sum else (C["alt_row"] if (ri-D) % 2 == 1 else None)
+        if is_sum:
+            ws.merge_cells(start_row=ri, start_column=1, end_row=ri, end_column=4)
+            wc(ws, ri, 1, tx["label"], bold=True, align="right", bg=bg, bdr=thin("bottom"), ind=1)
+            for ci in (2, 3, 4): pass
+            wc(ws, ri, 5, None, bg=bg, bdr=thin("bottom"))
+            wc(ws, ri, 6, None, bg=bg, bdr=thin("bottom"))
+            wc(ws, ri, 7, tx["balance"], bold=True, align="right", fmt=MFMT, bg=bg, bdr=thin("bottom"))
+        else:
+            vals = [tx["date"], tx["invoice"], tx["description"], tx["due_date"], tx["debit"], tx["credit"], tx["balance"]]
+            aligns = ["center", "center", "left", "center", "right", "right", "right"]
+            fmts = [None, None, None, None, MFMT, MFMT, MFMT]
+            fgs = ["000000"]*4 + [C["debit_fg"], C["credit_fg"], "000000"]
+            for ci, (v, a, f, fg) in enumerate(zip(vals, aligns, fmts, fgs), 1):
+                if ci == 7 and v is not None: fg = C["neg_bal"] if v < 0 else "000000"
+                wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
+        ws.row_dimensions[ri].height = 15
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:D{T}")
+    wc(ws, T, 1, "TOTAL", bold=True, fg=C["col_hdr_fg"], bg=C["scania_red"], align="right", bdr=thin(), ind=1)
+    for ci, col in [(5, "E"), (6, "F")]:
+        c = ws.cell(row=T, column=ci, value=f"=SUMIF(A{D}:A{T-1},\"<>\",{col}{D}:{col}{T-1})" if False else f"=SUM({col}{D}:{col}{T-1})")
+        c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+        c.fill = PatternFill("solid", start_color=C["scania_red"])
+        c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    closing = next((t["balance"] for t in reversed(txs) if t["is_summary"] and t["label"] == "Closing"), None)
+    c = ws.cell(row=T, column=7, value=closing)
+    c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+    c.fill = PatternFill("solid", start_color=C["scania_red"])
+    c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    ws.row_dimensions[T].height = 18
+    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:G{T-1}"
+    ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTOXPRESS LIMITED PARSER  (date wraps across 3 lines: "DD-MM-", data, "YYYY")
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_PREFIX_AX = re.compile(r"^\d{2}-\d{2}-$")
+YEAR_AX = re.compile(r"^\d{4}$")
+TAXINV_AX = re.compile(r"^\d{15,}$")
+LPO_AX = re.compile(r"^(POHH|XNB)")
+
+def parse_autoxpress(lines):
+    hdr = {"account_no": "", "customer": "New Muthokinju Hardware", "email": "", "tpin": "",
+           "sales_group": "", "pay_term": "", "currency": "KES", "credit_limit": None,
+           "statement_date": "", "buckets": {}, "total_balance_due": None}
+    full = "\n".join(lines)
+    m = re.search(r"A/C No:\s*(\S+)", full)
+    if m: hdr["account_no"] = m.group(1)
+    m = re.search(r"financemanager@\S+", full)
+    if m: hdr["email"] = m.group(0)
+    m = re.search(r"TPIN:\s*(\S+)", full)
+    if m: hdr["tpin"] = m.group(1)
+    m = re.search(r"SALES GROUP:\s*(.+)", full)
+    if m: hdr["sales_group"] = m.group(1).strip()
+    m = re.search(r"PAY TERM:\s*(.+)", full)
+    if m: hdr["pay_term"] = m.group(1).strip()
+    m = re.search(r"CREDIT LIMIT:\s*([\d,]+)", full)
+    if m: hdr["credit_limit"] = pnf(m.group(1))
+    m = re.search(r"STATEMENT DATE:\s*(\S+)", full)
+    if m: hdr["statement_date"] = m.group(1)
+
+    m = re.search(r"(-?[\d,]+)\s+(-?[\d,]+)\s+(-?[\d,]+)\s+(-?[\d,]+)\s+(-?[\d,]+)\s+(-?[\d,]+)\s*\n\s*[\d.]+%",
+                  full)
+    if m:
+        hdr["buckets"] = {"120plus": pnf(m.group(1)), "d90": pnf(m.group(2)), "d60": pnf(m.group(3)),
+                          "d30": pnf(m.group(4)), "current_balance": pnf(m.group(5)), "balance": pnf(m.group(6))}
+    m = re.search(r"TOTAL BALANCE DUE\s*:\s*([\d,\-]+)", full)
+    if m: hdr["total_balance_due"] = pnf(m.group(1))
+
+    clean = [l.strip() for l in lines if l.strip()]
+    txs = []; i = 0; pending_date = None
+    while i < len(clean):
+        ln = clean[i]
+        if DATE_PREFIX_AX.match(ln):
+            pending_date = ln; i += 1; continue
+        if YEAR_AX.match(ln) and pending_date and txs:
+            txs[-1]["date"] = pending_date + ln
+            pending_date = None; i += 1; continue
+        if pending_date is not None:
+            toks = ln.split()
+            if len(toks) >= 4:
+                rest, last4 = toks[:-4], toks[-4:]
+                tax_invoice = ""; lpo = ""; gp_parts = []
+                for tok in rest:
+                    if TAXINV_AX.match(tok): tax_invoice = tok
+                    elif LPO_AX.match(tok): lpo = (lpo + " " + tok).strip()
+                    else: gp_parts.append(tok)
+                opening, invoice, payment, cumulative = (pnf(x) for x in last4)
+                txs.append({"date": None, "tax_invoice": tax_invoice, "gp_invoice": " ".join(gp_parts),
+                            "lpo_no": lpo, "opening_bal": opening, "invoice": invoice,
+                            "payment": payment, "cumulative": cumulative})
+        i += 1
+    return hdr, txs
+
+def excel_autoxpress(hdr, txs):
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
+    ws.sheet_properties.tabColor = C["autoxpress_amber"]
+    for i, w in enumerate([12, 22, 16, 20, 14, 12, 12, 14], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    banner(ws, 1, 8, "AUTOXPRESS LIMITED  |  ACCOUNT STATEMENT", C["autoxpress_amber"])
+
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [("Customer", hdr.get("customer", ""), "A/C No.", hdr.get("account_no", "")),
+            ("TPIN", hdr.get("tpin", ""), "Sales Group", hdr.get("sales_group", "")),
+            ("Pay Term", hdr.get("pay_term", ""), "Credit Limit",
+             f"KES {hdr['credit_limit']:,.0f}" if hdr.get("credit_limit") is not None else ""),
+            ("Statement Date", hdr.get("statement_date", ""), "Currency", hdr.get("currency", "KES"))]
+    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
+        for ci, lbl, val in [(1, l1, v1), (5, l2, v2)]:
+            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci+1)
+            ws.merge_cells(start_row=r, start_column=ci+2, end_row=r, end_column=ci+2)
+            lc = ws.cell(row=r, column=ci, value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
+            vc = ws.cell(row=r, column=ci+2, value=val); vc.font=vf; vc.alignment=al
+        ws.row_dimensions[r].height = 16
+
+    H = 7
+    col_headers(ws, H, ["Date", "Tax Invoice", "GP Invoice", "LPO Number", "Opening Bal. (KES)",
+                        "Invoice (KES)", "Payment (KES)", "Cummulative (KES)"], C["autoxpress_amber"])
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_credit = (tx["payment"] or 0) > 0
+        bg = C["credit_row"] if is_credit else (C["alt_row"] if (ri-D) % 2 == 1 else None)
+        vals = [tx["date"], tx["tax_invoice"], tx["gp_invoice"], tx["lpo_no"],
+                tx["opening_bal"], tx["invoice"], tx["payment"], tx["cumulative"]]
+        aligns = ["center", "center", "center", "center", "right", "right", "right", "right"]
+        fmts = [None, None, None, None, IFMT, IFMT, IFMT, IFMT]
+        fgs = ["000000"]*4 + ["000000", C["debit_fg"], C["credit_fg"], "000000"]
+        for ci, (v, a, f, fg) in enumerate(zip(vals, aligns, fmts, fgs), 1):
+            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
+        ws.row_dimensions[ri].height = 15
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:D{T}")
+    wc(ws, T, 1, "TOTAL", bold=True, fg=C["col_hdr_fg"], bg=C["autoxpress_amber"], align="right", bdr=thin(), ind=1)
+    for ci, col in [(6, "F"), (7, "G")]:
+        c = ws.cell(row=T, column=ci, value=f"=SUM({col}{D}:{col}{T-1})")
+        c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+        c.fill = PatternFill("solid", start_color=C["autoxpress_amber"])
+        c.number_format = IFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    last_cum = txs[-1]["cumulative"] if txs else None
+    for ci in (5, 8):
+        c = ws.cell(row=T, column=ci, value=last_cum if ci == 8 else "")
+        c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+        c.fill = PatternFill("solid", start_color=C["autoxpress_amber"])
+        c.number_format = IFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    ws.row_dimensions[T].height = 18
+    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:H{T-1}"
+    ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
+
+    b = hdr.get("buckets") or {}
+    if any(v is not None for v in b.values()):
+        ws2 = wb.create_sheet("Ageing Summary"); ws2.sheet_properties.tabColor = C["autoxpress_amber"]
+        for col, w in [("A", 22), ("B", 18)]: ws2.column_dimensions[col].width = w
+        ws2.merge_cells("A1:B1")
+        wc(ws2, 1, 1, "AGEING SUMMARY", bold=True, fg=C["col_hdr_fg"], bg=C["autoxpress_amber"], align="center", sz=12)
+        ws2.row_dimensions[1].height = 26
+        rows2 = [("120+ Days", b.get("120plus")), ("90 Days", b.get("d90")), ("60 Days", b.get("d60")),
+                 ("30 Days", b.get("d30")), ("Current Balance", b.get("current_balance")),
+                 ("Balance", b.get("balance")), ("Total Balance Due", hdr.get("total_balance_due"))]
+        for ri, (lbl, val) in enumerate(rows2, start=2):
+            bold = lbl == "Total Balance Due"
+            wc(ws2, ri, 1, lbl, bold=bold, align="left", bdr=thin("bottom"), bg=C["info_bg"] if bold else None)
+            wc(ws2, ri, 2, val, align="right", fmt=IFMT, bdr=thin("bottom"),
+               fg=C["neg_bal"] if (val or 0) < 0 else "000000", bg=C["info_bg"] if bold else None)
+            ws2.row_dimensions[ri].height = 16
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN CONVERT
 # ══════════════════════════════════════════════════════════════════════════════
 def convert(pdf_bytes):
@@ -734,6 +1281,23 @@ def convert(pdf_bytes):
     elif fmt=="savannah":
         hdr,txs=parse_savannah(lines)
         return fmt,len(txs),0,pages,excel_savannah(hdr,txs)
+    elif fmt=="skylife":
+        hdr,txs=parse_skylife(lines)
+        return fmt,len(txs),0,pages,excel_skylife(hdr,txs)
+    elif fmt=="springtech":
+        hdr,txs=parse_springtech(lines)
+        return fmt,len(txs),0,pages,excel_aging_statement(hdr,txs,C["springtech_indigo"],
+                "SPRINGTECH (K) LTD  |  CUSTOMER STATEMENT")
+    elif fmt=="transsolutions":
+        hdr,txs=parse_transsolutions(lines)
+        return fmt,len(txs),0,pages,excel_aging_statement(hdr,txs,C["transsolutions_cyan"],
+                "TRANS-SOLUTIONS (E.A) LTD  |  CUSTOMER STATEMENT")
+    elif fmt=="scania":
+        hdr,txs=parse_scania(lines)
+        return fmt,len(txs),0,pages,excel_scania(hdr,txs)
+    elif fmt=="autoxpress":
+        hdr,txs=parse_autoxpress(lines)
+        return fmt,len(txs),0,pages,excel_autoxpress(hdr,txs)
     return "unknown",0,0,pages,None
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -750,10 +1314,14 @@ if uploaded:
             st.error(f"❌ Error: {e}"); st.stop()
 
     if fmt=="unknown":
-        st.warning("⚠️ Format not recognised. Supported: Savannah Cement, National Cement, Mombasa Cement, Karsan Ramji.")
+        st.warning("⚠️ Format not recognised. Supported: Savannah Cement, National Cement, Mombasa Cement, "
+                   "Karsan Ramji, Skylife, Springtech, Scania, Trans-Solutions, AutoXpress.")
     else:
         labels={"savannah":"Savannah Cement","national":"National Cement",
-                "mombasa":"Mombasa Cement","karsan":"Karsan Ramji (Ndovu)"}
+                "mombasa":"Mombasa Cement","karsan":"Karsan Ramji (Ndovu)",
+                "skylife":"Skylife Kenya","springtech":"Springtech (K) Ltd",
+                "scania":"Scania East Africa","transsolutions":"Trans-Solutions (E.A)",
+                "autoxpress":"AutoXpress Limited"}
         label=labels.get(fmt,fmt)
         chq_txt=f" · {chq_count} cheques" if chq_count else ""
         st.markdown(f"""<div class="ok">🎉 &nbsp;<b>{label}</b> converted successfully! &nbsp;·&nbsp;
