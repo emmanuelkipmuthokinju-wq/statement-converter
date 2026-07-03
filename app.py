@@ -93,6 +93,7 @@ st.markdown("""
   <span class="badge">🟧 AutoXpress</span>
   <span class="badge">🟥 Gathani</span>
   <span class="badge">🩵 Anco Trading</span>
+  <span class="badge">🟤 Doshi / Ultra (COA)</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
 """, unsafe_allow_html=True)
@@ -112,6 +113,7 @@ with st.expander("🎨 Supported formats"):
 | 🟧 **AutoXpress** | Date · Tax Invoice · GP Invoice · LPO · Opening Bal · Invoice · Payment · Cummulative + Ageing Summary sheet |
 | 🟥 **Gathani Limited** | Date · Particulars · Doc Ref · Debit · Credit · Nett Amount + Ageing Summary sheet |
 | 🩵 **Anco Trading Ltd** | Transaction · Doc No · Ref No · Doc Date · DR/CR · Debit · Credit · Balance + Ageing Analysis sheet |
+| 🟤 **Doshi / Ultra (COA)** | Two-column layout: Debit (Date · Particulars · CU Invoice · Amount) + Credit (Date · Particulars · Amount) + Ageing Summary |
     """)
 
 # ── Colours & helpers ──────────────────────────────────────────────────────────
@@ -195,6 +197,8 @@ def detect(lines):
     if "AR Invoice" in t and "BP REF" in t:                           return "karsan"
     if "GATHANI" in t.upper():                                         return "gathani"
     if "ANCO TRADING" in t.upper():                                    return "anco"
+    if "Confirmation of Accounts" in t or "Doshi" in t or "Ultra Multiware" in t: return "coa"
+    if re.search(r"Date\s+Particulars\s+Debit Amount", t):                 return "coa"
     return "unknown"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1665,6 +1669,257 @@ def excel_anco(hdr, txs):
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIRMATION OF ACCOUNTS PARSER
+# Format used by Doshi Auto Spares, Ultra Multiware, and similar suppliers.
+# Two-column layout: Debit entries on the left, Credit entries on the right,
+# on the same line. Ageing buckets at the bottom.
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_COA  = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{2}$")
+MONEY_COA = re.compile(r"^[\d,]+\.\d{2}$")
+CU_COA    = re.compile(r"^\d{16,19}$")
+
+SKIP_COA = {"Date","Particulars","Debit","Amount","Credit","Dear","Sub:",
+            "Given","Kindly","Please","period.","I/We","P.O","P.O.BOX",
+            "NAIROBI","To","From:","continued","Page"}
+
+def parse_coa(lines):
+    hdr = {"supplier": "", "customer": "New Muthokinju Hardware Limited",
+           "date": "", "period": "", "currency": "KES",
+           "closing_balance": None}
+
+    # Extract supplier and header info from first few lines
+    for ln in lines[:8]:
+        m = re.search(r"From:\s*(.+)", ln)
+        if m:
+            candidate = m.group(1).strip()
+            # Clean up address noise on the same line
+            candidate = re.split(r"P\.O\.?\s*Box|P\.O\.?BOX", candidate)[0].strip()
+            if candidate: hdr["supplier"] = candidate
+        m = re.search(r"Date\s*:\s*([\d\w-]+)", ln)
+        if m: hdr["date"] = m.group(1)
+
+    for ln in lines:
+        m = re.search(r"(\d{1,2}-[A-Za-z]{3}-\d{2})\s+to\s+(\d{1,2}-[A-Za-z]{3}-\d{2})", ln)
+        if m: hdr["period"] = f"{m.group(1)} to {m.group(2)}"; break
+
+    debits  = []   # [{date, particulars, cu_invoice, amount}]
+    credits = []   # [{date, particulars, amount}]
+    ageing  = {}
+
+    for ln in lines:
+        ln = ln.strip()
+        if not ln: continue
+        parts = ln.split()
+        if not parts: continue
+
+        # ── Closing Balance ────────────────────────────────────────────────────
+        if "Closing" in ln and "Balance" in ln:
+            nums = [p for p in parts if MONEY_COA.match(p)]
+            if nums: hdr["closing_balance"] = pnf(nums[-1])
+            continue
+
+        # ── Ageing row: 5–6 money values, no leading date ─────────────────────
+        money_count = sum(1 for p in parts if MONEY_COA.match(p))
+        if money_count >= 4 and not DATE_COA.match(parts[0]):
+            nums = [pnf(p) for p in parts if MONEY_COA.match(p)]
+            if len(nums) >= 5:
+                keys = ["120_days","90_days","60_days","30_days","current","total_due"]
+                for ki, v in enumerate(nums):
+                    if ki < len(keys): ageing[keys[ki]] = v
+            continue
+
+        # ── Skip noise lines ───────────────────────────────────────────────────
+        if any(k in ln for k in SKIP_COA) and not DATE_COA.match(parts[0]):
+            continue
+        if not parts or not DATE_COA.match(parts[0]):
+            continue
+
+        # ── Transaction line ──────────────────────────────────────────────────
+        date_positions = [i for i,p in enumerate(parts) if DATE_COA.match(p)]
+        money_positions= [i for i,p in enumerate(parts) if MONEY_COA.match(p)]
+
+        if not money_positions: continue
+
+        # Debit entry (always starts at index 0)
+        first_money = money_positions[0]
+        debit_date  = parts[0]
+        debit_amount= pnf(parts[first_money])
+        debit_mid   = parts[1:first_money]
+        cu_inv = next((p for p in debit_mid if CU_COA.match(p)), "")
+        debit_desc  = " ".join(p for p in debit_mid if p not in (cu_inv, "-"))
+        debits.append({"date": debit_date, "particulars": debit_desc,
+                       "cu_invoice": cu_inv, "amount": debit_amount})
+
+        # Credit entry (only if a second date exists on the same line)
+        if len(date_positions) >= 2:
+            cr_date_pos  = date_positions[1]
+            cr_money_pos = next((i for i in money_positions if i > cr_date_pos), None)
+            if cr_money_pos is not None:
+                cr_date   = parts[cr_date_pos]
+                cr_amount = pnf(parts[cr_money_pos])
+                cr_desc   = " ".join(parts[cr_date_pos+1:cr_money_pos])
+                credits.append({"date": cr_date, "particulars": cr_desc, "amount": cr_amount})
+
+    return hdr, debits, credits, ageing
+
+
+def excel_coa(hdr, debits, credits, ageing):
+    """Build Excel: Transactions sheet + Ageing Summary sheet."""
+    supplier = hdr.get("supplier", "Supplier Statement")
+    COA_COLOR = "1A237E"   # deep indigo
+    COA_DR    = "BF360C"   # debit header — deep orange
+    COA_CR    = "1B5E20"   # credit header — deep green
+
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws.title = "Statement"; ws.sheet_properties.tabColor = COA_COLOR
+
+    # Column widths: Date | Particulars | CU Invoice | Amount | | Date | Particulars | Amount
+    for i, w in enumerate([13, 28, 22, 16, 2, 13, 28, 16], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ── Title banner ──────────────────────────────────────────────────────────
+    ws.merge_cells("A1:H1")
+    c = ws["A1"]
+    c.value = f"{supplier.upper()}  |  CONFIRMATION OF ACCOUNTS"
+    c.font  = Font(name="Arial", bold=True, size=13, color="FFFFFF")
+    c.fill  = PatternFill("solid", start_color=COA_COLOR)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    # ── Info block ────────────────────────────────────────────────────────────
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [
+        ("Customer",   hdr.get("customer",""),  "Statement Date", hdr.get("date","")),
+        ("Period",     hdr.get("period",""),     "Currency",       hdr.get("currency","KES")),
+        ("Closing Balance", f"KES {hdr['closing_balance']:,.2f}" if hdr.get("closing_balance") else "", "", ""),
+    ]
+    for r,(l1,v1,l2,v2) in enumerate(info, start=2):
+        for ci,lbl,val in [(1,l1,v1),(5,l2,v2)]:
+            ws.merge_cells(start_row=r,start_column=ci,end_row=r,end_column=ci+1)
+            lc=ws.cell(row=r,column=ci,value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
+            vc=ws.cell(row=r,column=ci+2,value=val); vc.font=vf; vc.alignment=al
+        ws.row_dimensions[r].height = 16
+
+    # ── Split headers: Debit left | spacer | Credit right ─────────────────────
+    H = 5
+    # Debit headers (cols 1-4)
+    for ci, h in enumerate(["Date","Particulars","CU Invoice No.","Debit (KES)"], 1):
+        wc(ws, H, ci, h, bold=True, fg="FFFFFF", bg=COA_DR, align="center", bdr=thin())
+    # Spacer col 5
+    ws.cell(row=H, column=5).fill = PatternFill("solid", start_color="EEEEEE")
+    # Credit headers (cols 6-8)
+    for ci, h in zip([6,7,8], ["Date","Particulars","Credit (KES)"]):
+        wc(ws, H, ci, h, bold=True, fg="FFFFFF", bg=COA_CR, align="center", bdr=thin())
+    ws.row_dimensions[H].height = 22
+
+    # ── Data rows ─────────────────────────────────────────────────────────────
+    D = H + 1
+    max_rows = max(len(debits), len(credits))
+
+    for ri in range(max_rows):
+        r = D + ri
+        bg_dr = "FBE9E7" if ri % 2 == 1 else None   # faint orange for debits
+        bg_cr = "E8F5E9" if ri % 2 == 1 else None   # faint green for credits
+
+        # Debit side
+        if ri < len(debits):
+            tx = debits[ri]
+            is_opening = "Opening" in str(tx.get("particulars",""))
+            bg_dr = C["info_bg"] if is_opening else bg_dr
+            wc(ws,r,1,tx["date"],     align="center", bg=bg_dr, bdr=thin("bottom"))
+            wc(ws,r,2,tx["particulars"],align="left",  bg=bg_dr, bdr=thin("bottom"))
+            wc(ws,r,3,tx["cu_invoice"],align="center", bg=bg_dr, bdr=thin("bottom"),
+               fg="555555", sz=8)
+            wc(ws,r,4,tx["amount"],   align="right",  bg=bg_dr, bdr=thin("bottom"),
+               fmt=MFMT, fg=C["debit_fg"], bold=is_opening)
+        else:
+            for ci in range(1,5):
+                ws.cell(row=r,column=ci).border = thin("bottom")
+
+        # Spacer
+        ws.cell(row=r,column=5).fill = PatternFill("solid",start_color="EEEEEE")
+
+        # Credit side
+        if ri < len(credits):
+            tx = credits[ri]
+            wc(ws,r,6,tx["date"],        align="center", bg=bg_cr, bdr=thin("bottom"))
+            wc(ws,r,7,tx["particulars"], align="left",   bg=bg_cr, bdr=thin("bottom"))
+            wc(ws,r,8,tx["amount"],      align="right",  bg=bg_cr, bdr=thin("bottom"),
+               fmt=MFMT, fg=C["credit_fg"])
+        else:
+            for ci in range(6,9):
+                ws.cell(row=r,column=ci).border = thin("bottom")
+
+        ws.row_dimensions[r].height = 15
+
+    # ── Totals row ─────────────────────────────────────────────────────────────
+    T = D + max_rows
+    ws.merge_cells(f"A{T}:C{T}")
+    wc(ws,T,1,"TOTAL DEBITS",bold=True,fg="FFFFFF",bg=COA_DR,align="right",bdr=thin(),ind=1)
+    c=ws.cell(row=T,column=4,value=f"=SUM(D{D}:D{T-1})")
+    c.font=Font(name="Arial",bold=True,size=9,color="FFFFFF")
+    c.fill=PatternFill("solid",start_color=COA_DR)
+    c.number_format=MFMT; c.alignment=Alignment(horizontal="right",vertical="center"); c.border=thin()
+
+    ws.cell(row=T,column=5).fill = PatternFill("solid",start_color="EEEEEE")
+
+    ws.merge_cells(f"F{T}:G{T}")
+    wc(ws,T,6,"TOTAL CREDITS",bold=True,fg="FFFFFF",bg=COA_CR,align="right",bdr=thin(),ind=1)
+    c=ws.cell(row=T,column=8,value=f"=SUM(H{D}:H{T-1})")
+    c.font=Font(name="Arial",bold=True,size=9,color="FFFFFF")
+    c.fill=PatternFill("solid",start_color=COA_CR)
+    c.number_format=MFMT; c.alignment=Alignment(horizontal="right",vertical="center"); c.border=thin()
+    ws.row_dimensions[T].height=18
+
+    # ── Closing balance summary below totals ──────────────────────────────────
+    SUM_R = T + 1
+    ws.merge_cells(f"A{SUM_R}:C{SUM_R}")
+    wc(ws,SUM_R,1,"CLOSING BALANCE",bold=True,fg="FFFFFF",bg=COA_COLOR,align="right",bdr=thin(),ind=1)
+    c=ws.cell(row=SUM_R,column=4,value=hdr.get("closing_balance"))
+    c.font=Font(name="Arial",bold=True,size=10,color="FFFFFF")
+    c.fill=PatternFill("solid",start_color=COA_COLOR)
+    c.number_format=MFMT; c.alignment=Alignment(horizontal="right",vertical="center"); c.border=thin()
+    for ci in [5,6,7,8]:
+        ws.cell(row=SUM_R,column=ci).fill=PatternFill("solid",start_color=COA_COLOR)
+        ws.cell(row=SUM_R,column=ci).border=thin()
+    ws.row_dimensions[SUM_R].height=20
+
+    ws.freeze_panes = f"A{D}"
+    ws.page_setup.orientation="landscape"; ws.page_setup.fitToPage=True; ws.page_setup.fitToWidth=1
+
+    # ── Ageing Summary sheet ──────────────────────────────────────────────────
+    if ageing:
+        ws2 = wb.create_sheet("Ageing Summary"); ws2.sheet_properties.tabColor=COA_COLOR
+        for col,w in [("A",20),("B",18)]: ws2.column_dimensions[col].width=w
+        ws2.merge_cells("A1:B1")
+        wc(ws2,1,1,"AGEING SUMMARY",bold=True,fg="FFFFFF",bg=COA_COLOR,align="center",sz=12)
+        ws2.row_dimensions[1].height=26
+
+        # Header row
+        for ci,h in enumerate(["Ageing Bucket","Amount (KES)"],1):
+            wc(ws2,2,ci,h,bold=True,fg="FFFFFF",bg=COA_COLOR,align="center",bdr=thin())
+        ws2.row_dimensions[2].height=20
+
+        bucket_labels = {
+            "120_days":"120+ Days","90_days":"90 Days","60_days":"60 Days",
+            "30_days":"30 Days","current":"Current Balance","total_due":"Total Amount Due"
+        }
+        for ri,(key,lbl) in enumerate(bucket_labels.items(),start=3):
+            val = ageing.get(key)
+            bold = key == "total_due"
+            bg2 = C["info_bg"] if bold else (C["alt_row"] if ri%2==0 else None)
+            wc(ws2,ri,1,lbl,bold=bold,align="left",bdr=thin("bottom"),bg=bg2)
+            wc(ws2,ri,2,val,align="right",fmt=MFMT,bdr=thin("bottom"),
+               fg=C["debit_fg"],bg=bg2,bold=bold)
+            ws2.row_dimensions[ri].height=16
+
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN CONVERT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1711,6 +1966,9 @@ def convert(pdf_bytes):
     elif fmt=="anco":
         hdr,txs=parse_anco(lines)
         return fmt,len(txs),0,pages,excel_anco(hdr,txs)
+    elif fmt=="coa":
+        hdr,debits,credits,ageing=parse_coa(lines)
+        return fmt,len(debits)+len(credits),0,pages,excel_coa(hdr,debits,credits,ageing)
     return "unknown",0,0,pages,None
 
 
@@ -2276,6 +2534,7 @@ if uploaded:
                 "scania":"Scania East Africa","transsolutions":"Trans-Solutions (E.A)",
                 "autoxpress":"AutoXpress Limited","gathani":"Gathani Limited",
                 "anco":"Anco Trading Ltd",
+                "coa":"Confirmation of Accounts",
             }
             label   = labels.get(fmt, fmt)
             chq_txt = f" · {chq_count} cheques" if chq_count else ""
