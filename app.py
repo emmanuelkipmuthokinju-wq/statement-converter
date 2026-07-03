@@ -94,6 +94,7 @@ st.markdown("""
   <span class="badge">🟥 Gathani</span>
   <span class="badge">🩵 Anco Trading</span>
   <span class="badge">🟤 Doshi / Ultra (COA)</span>
+  <span class="badge">🟢 Bamburi Cement</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
 """, unsafe_allow_html=True)
@@ -114,6 +115,7 @@ with st.expander("🎨 Supported formats"):
 | 🟥 **Gathani Limited** | Date · Particulars · Doc Ref · Debit · Credit · Nett Amount + Ageing Summary sheet |
 | 🩵 **Anco Trading Ltd** | Transaction · Doc No · Ref No · Doc Date · DR/CR · Debit · Credit · Balance + Ageing Analysis sheet |
 | 🟤 **Doshi / Ultra (COA)** | Two-column layout: Debit (Date · Particulars · CU Invoice · Amount) + Credit (Date · Particulars · Amount) + Ageing Summary |
+| 🟢 **Bamburi Cement PLC** | Doc No · Delivery Note · Posting Date · Doc Type · Item Text/Ref · Qty · Unit · Amount · Running Balance |
     """)
 
 # ── Colours & helpers ──────────────────────────────────────────────────────────
@@ -124,7 +126,7 @@ C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20
          neg_bal="C62828", border="BDBDBD",
          skylife_teal="00838F", springtech_indigo="3F51B5", scania_red="C8102E",
          transsolutions_cyan="0097A7", autoxpress_amber="F57C00",
-         gathani_maroon="7B1C1C", anco_teal="00695C")
+         gathani_maroon="7B1C1C", anco_teal="00695C", bamburi_green="00843D")
 MFMT = '#,##0.00;(#,##0.00);"-"'
 IFMT = '#,##0;(#,##0);"-"'
 
@@ -195,6 +197,7 @@ def detect(lines):
     if "LPO No" in t or "Cheque no" in t:                             return "national"
     if "Due Date" in t and "Document" in t:                           return "savannah"
     if "AR Invoice" in t and "BP REF" in t:                           return "karsan"
+    if "BAMBURI CEMENT" in t.upper():                                  return "bamburi"
     if "GATHANI" in t.upper():                                         return "gathani"
     if "ANCO TRADING" in t.upper():                                    return "anco"
     if "Confirmation of Accounts" in t or "Doshi" in t or "Ultra Multiware" in t: return "coa"
@@ -1135,6 +1138,180 @@ def excel_scania(hdr, txs):
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BAMBURI CEMENT PLC PARSER
+#   Line shape (single physical line per pdfplumber, one row of the table):
+#     [DocNo] [DeliveryNote?] Mon DD, YYYY  DocType(1-3 words)  ItemText/PO/Truck...  [Qty Unit]  Amount  Balance
+#   The wrapped 2nd line of "Item Text" (e.g. "IV/ B-P 32.5R", "BAG") lands on its
+#   own line straight after — with no digits/money on it — so we fold it back in.
+# ══════════════════════════════════════════════════════════════════════════════
+MONTHS_BC = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"}
+MONEY_BC  = re.compile(r"^-?[\d,]+(\.\d{1,2})?$")
+DOCTYPE_BC = {
+    ("Data","Transfer"):        "Data Transfer",
+    ("Billing","doc.transfer"): "Billing doc.transfer",
+    ("Accounting","Docum"):     "Accounting Document",
+    ("Customer","Paymen"):      "Customer Payment",
+}
+
+def is_money_bc(tok):
+    return bool(tok) and bool(MONEY_BC.match(tok)) and any(ch.isdigit() for ch in tok)
+
+def parse_bamburi_row(toks):
+    if len(toks) < 4: return None
+    bal_tok, amt_tok = toks[-1], toks[-2]
+    if not (is_money_bc(bal_tok) and is_money_bc(amt_tok)): return None
+    balance, amount = pnf(bal_tok), pnf(amt_tok)
+    if balance is None or amount is None: return None
+
+    rest = toks[:-2]
+    unit, qty = "", None
+    if rest and rest[-1] in ("TO", "EA"):
+        unit = rest[-1]
+        if len(rest) >= 2:
+            try:
+                qty = float(rest[-2]); rest = rest[:-2]
+            except ValueError:
+                rest = rest[:-1]
+        else:
+            rest = rest[:-1]
+
+    month_idx = next((i for i, tk in enumerate(rest[:4]) if tk in MONTHS_BC), None)
+    if month_idx is None or month_idx + 2 >= len(rest): return None
+
+    doc_fields = rest[:month_idx]
+    date_str = f"{rest[month_idx]} {rest[month_idx+1]} {rest[month_idx+2]}"
+    after_date = rest[month_idx+3:]
+
+    doctype, item_rest = "", after_date
+    if len(after_date) >= 3 and (after_date[0], after_date[1]) == ("Customer", "Credit"):
+        doctype = "Customer Credit Memo"; item_rest = after_date[3:]
+    elif len(after_date) >= 2 and (after_date[0], after_date[1]) in DOCTYPE_BC:
+        doctype = DOCTYPE_BC[(after_date[0], after_date[1])]; item_rest = after_date[2:]
+    elif len(after_date) >= 2:
+        doctype = " ".join(after_date[:2]); item_rest = after_date[2:]
+    elif after_date:
+        doctype = after_date[0]; item_rest = []
+
+    if len(doc_fields) >= 2 and re.match(r"^\d+$", doc_fields[1]):
+        doc_number, delivery_note = doc_fields[0], doc_fields[1]
+    elif doc_fields:
+        doc_number, delivery_note = " ".join(doc_fields), ""
+    else:
+        doc_number, delivery_note = "", ""
+
+    return {"doc_number": doc_number, "delivery_note": delivery_note, "date": date_str,
+            "doc_type": doctype, "item_text": " ".join(item_rest), "qty": qty, "unit": unit,
+            "amount": amount, "balance": balance}
+
+def parse_bamburi(lines):
+    hdr = {"customer": "", "po_box": "", "location": "", "statement_date": "",
+           "period": "", "opening_balance": None, "closing_balance": None, "pin": ""}
+    SKIP_STARTS = ("BAMBURI CEMENT", "Kitui Road", "P.O. Box", "Tel:", "Mobile:",
+                   "Ke-customer.service", "PIN:", "Company", "Doc Delivery",
+                   "Number Note", "Account statement", "Balance carried forward",
+                   "Line Items", "No postings", "Final balance", "KES ")
+
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("PIN:"): hdr["pin"] = s.replace("PIN:", "").strip()
+        if s.startswith("Date:"): hdr["statement_date"] = s.replace("Date:", "").strip()
+        if s == "Company":
+            # Layout interleaves a "Date / Our Clerk / Telephone" side-block, so the
+            # customer's own block (name, PO Box, location) sits on every other line.
+            block = [x.strip() for x in lines[i+1:i+8]]
+            block = [x for x in block if not x.startswith(("Date:", "Our Clerk", "Telephone"))]
+            if len(block) > 0: hdr["customer"] = block[0]
+            if len(block) > 1 and block[1].upper().startswith("PO BOX"): hdr["po_box"] = block[1]
+            if len(block) > 2: hdr["location"] = block[2]
+        if s.startswith("Account statement for the period"):
+            m = re.search(r"from\s+(.+?)\s+to\s+(.+)$", s)
+            if m: hdr["period"] = f"{m.group(1)} to {m.group(2)}"
+        if s.startswith("Balance carried forward"):
+            for j in range(i+1, min(i+3, len(lines))):
+                v = pnf(lines[j].strip())
+                if v is not None: hdr["opening_balance"] = v; break
+        if s.startswith("Final balance"):
+            for j in range(i+1, min(i+3, len(lines))):
+                m = re.search(r"([\d,]+\.\d{2})", lines[j])
+                if m: hdr["closing_balance"] = pnf(m.group(1)); break
+
+    txs = []
+    for ln in lines:
+        s = ln.strip()
+        if not s or any(s.startswith(p) for p in SKIP_STARTS): continue
+        toks = s.split()
+        if not toks: continue
+        tx = parse_bamburi_row(toks)
+        if tx is not None:
+            txs.append(tx)
+        elif txs and not is_money_bc(toks[-1]):
+            # wrapped continuation of the previous row's Item Text
+            txs[-1]["item_text"] = (txs[-1]["item_text"] + " " + s).strip()
+    return hdr, txs
+
+def excel_bamburi(hdr, txs):
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
+    ws.sheet_properties.tabColor = C["bamburi_green"]
+    for i, w in enumerate([14, 14, 13, 18, 38, 9, 7, 15, 16], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    banner(ws, 1, 9, "BAMBURI CEMENT PLC  |  ACCOUNT STATEMENT", C["bamburi_green"])
+
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [("Customer", hdr.get("customer", ""), "PIN", hdr.get("pin", "")),
+            ("PO Box", hdr.get("po_box", ""), "Location", hdr.get("location", "")),
+            ("Period", hdr.get("period", ""), "Statement Date", hdr.get("statement_date", ""))]
+    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=1)
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=4)
+        ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=6)
+        ws.merge_cells(start_row=r, start_column=7, end_row=r, end_column=9)
+        lc = ws.cell(row=r, column=1, value=l1); lc.font=lf; lc.fill=lb; lc.alignment=al
+        vc = ws.cell(row=r, column=2, value=v1); vc.font=vf; vc.alignment=al
+        lc2 = ws.cell(row=r, column=5, value=l2); lc2.font=lf; lc2.fill=lb; lc2.alignment=al
+        vc2 = ws.cell(row=r, column=7, value=v2); vc2.font=vf; vc2.alignment=al
+        ws.row_dimensions[r].height = 16
+
+    H = 6
+    col_headers(ws, H, ["Doc Number", "Delivery Note", "Posting Date", "Doc Type",
+                         "Item Text / Ref", "Qty", "Unit", "Amount (KES)", "Running Balance (KES)"],
+                C["bamburi_green"])
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        bg = C["alt_row"] if (ri - D) % 2 == 1 else None
+        amt = tx["amount"]
+        amt_fg = C["credit_fg"] if (amt is not None and amt < 0) else C["debit_fg"]
+        vals   = [tx["doc_number"], tx["delivery_note"], tx["date"], tx["doc_type"],
+                  tx["item_text"], tx["qty"], tx["unit"], tx["amount"], tx["balance"]]
+        aligns = ["left", "left", "center", "left", "left", "right", "center", "right", "right"]
+        fmts   = [None, None, None, None, None, "#,##0.000;(#,##0.000)", None, MFMT, MFMT]
+        fgs    = ["000000"]*7 + [amt_fg, "000000"]
+        for ci, (v, a, f, fg) in enumerate(zip(vals, aligns, fmts, fgs), 1):
+            if ci == 9 and v is not None: fg = C["neg_bal"] if v < 0 else "000000"
+            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
+        ws.row_dimensions[ri].height = 15
+
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:G{T}")
+    wc(ws, T, 1, "TOTAL", bold=True, fg=C["col_hdr_fg"], bg=C["bamburi_green"], align="right", bdr=thin(), ind=1)
+    c = ws.cell(row=T, column=8, value=f"=SUM(H{D}:H{T-1})")
+    c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+    c.fill = PatternFill("solid", start_color=C["bamburi_green"])
+    c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    closing = hdr.get("closing_balance")
+    if closing is None and txs: closing = txs[-1]["balance"]
+    c = ws.cell(row=T, column=9, value=closing)
+    c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+    c.fill = PatternFill("solid", start_color=C["bamburi_green"])
+    c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    ws.row_dimensions[T].height = 18
+
+    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:I{T-1}"
+    ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+# ══════════════════════════════════════════════════════════════════════════════
 # AUTOXPRESS LIMITED PARSER  (date wraps across 3 lines: "DD-MM-", data, "YYYY")
 # ══════════════════════════════════════════════════════════════════════════════
 DATE_PREFIX_AX = re.compile(r"^\d{2}-\d{2}-$")
@@ -1960,6 +2137,9 @@ def convert(pdf_bytes):
     elif fmt=="autoxpress":
         hdr,txs=parse_autoxpress(lines)
         return fmt,len(txs),0,pages,excel_autoxpress(hdr,txs)
+    elif fmt=="bamburi":
+        hdr,txs=parse_bamburi(lines)
+        return fmt,len(txs),0,pages,excel_bamburi(hdr,txs)
     elif fmt=="gathani":
         hdr,txs=parse_gathani(lines)
         return fmt,len(txs),0,pages,excel_gathani(hdr,txs)
@@ -2535,6 +2715,7 @@ if uploaded:
                 "autoxpress":"AutoXpress Limited","gathani":"Gathani Limited",
                 "anco":"Anco Trading Ltd",
                 "coa":"Confirmation of Accounts",
+                "bamburi":"Bamburi Cement PLC",
             }
             label   = labels.get(fmt, fmt)
             chq_txt = f" · {chq_count} cheques" if chq_count else ""
