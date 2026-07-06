@@ -94,6 +94,7 @@ st.markdown("""
   <span class="badge">🟥 Gathani</span>
   <span class="badge">🩵 Anco Trading</span>
   <span class="badge">🟤 Doshi / Ultra (COA)</span>
+  <span class="badge">🔴 Simba Corporation</span>
   <span class="badge">🟢 Bamburi Cement</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
@@ -202,6 +203,7 @@ def detect(lines):
     if "ANCO TRADING" in t.upper():                                    return "anco"
     if "Confirmation of Accounts" in t or "Doshi" in t or "Ultra Multiware" in t: return "coa"
     if re.search(r"Date\s+Particulars\s+Debit Amount", t):                 return "coa"
+    if "Simba Corp" in t or "SIMBA CORP" in t.upper() or ("Customer No." in t and "Statement No." in t and "CU Invoice No." in t): return "simba"
     return "unknown"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2100,6 +2102,261 @@ def excel_coa(hdr, debits, credits, ageing):
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN CONVERT
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SIMBA CORPORATION PARSER
+# Format: Simba Corp Customer Statement — 9 columns, multi-line Reference,
+# continuation suffix lines, optional Veh Reg, ageing on last page.
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_SC  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+MONEY_SC = re.compile(r"^-?[\d,]+\.\d{2}$")
+DOC_SC   = re.compile(r"^(SPV|SPR|CRJP|GJVP)-\S+$")
+CU_SC    = re.compile(r"^\d{19}$")
+VEH_SC   = re.compile(r"^K[A-Z]{2}\d{3}[A-Z]$")   # e.g. KDL028L
+CONT_SC  = re.compile(r"^\d{2,5}$")                # numeric suffix e.g. 020, 394
+CONT_LPO = re.compile(r"^[A-Z0-9]{6,}$")            # alpha suffix e.g. H0012507POH000
+
+SKIP_SC = {"Customer Statement","Posting Date","Amount","Simba Corporation",
+           "P.O. Box 48296","PIN:","Starting Date","Ending Date","Total KES",
+           "Aged Summary","0 - 30 Days","KES"}
+
+def _skip_sc(ln):
+    return (any(k in ln for k in SKIP_SC) or
+            ln.startswith("New Muthokinju") or ln.startswith("NAIROBI") or
+            ln.startswith("P.O. Box 64") or ln.startswith("00620") or
+            bool(re.match(r"^Page \d+", ln)))
+
+def _parse_date_sc(s):
+    from datetime import datetime
+    try: return datetime.strptime(s.strip(), "%d/%m/%Y").date()
+    except: return s
+
+def parse_simba(lines):
+    hdr = {"customer":"New Muthokinju Hardware Ltd",
+           "supplier":"Simba Corporation Limited"}
+    for ln in lines:
+        m = re.search(r"Customer No\.\s+(\S+)", ln)
+        if m: hdr["customer_no"] = m.group(1)
+        m = re.search(r"Statement No\.\s+(\S+)", ln)
+        if m: hdr["statement_no"] = m.group(1)
+        m = re.search(r"Document Date\s+(\S+)", ln)
+        if m: hdr["doc_date"] = m.group(1)
+        m = re.search(r"Starting Date\s+(\S+)", ln)
+        if m: hdr["start_date"] = m.group(1)
+        m = re.search(r"Ending Date\s+(\S+)", ln)
+        if m: hdr["end_date"] = m.group(1)
+
+    txs = []; ageing = {}; i = 0
+
+    while i < len(lines):
+        ln = lines[i].strip(); i += 1
+        if not ln or _skip_sc(ln): continue
+
+        # Ageing table — "Days to Due Date" header, then "KES ..." line next
+        if "Days to Due Date" in ln:
+            while i < len(lines):
+                ag = lines[i].strip(); i += 1
+                if "KES" in ag:
+                    nums = [pnf(p) for p in ag.split() if MONEY_SC.match(p)]
+                    labs = ["0_30","31_60","61_91","92_121","over_121","amount_due"]
+                    for ki, v in enumerate(nums):
+                        if ki < len(labs): ageing[labs[ki]] = v
+                    break
+            continue
+
+        parts = ln.split()
+        if not parts: continue
+
+        # Continuation lines — attach to last tx reference
+        if not DATE_SC.match(parts[0]):
+            if txs and (CONT_SC.match(ln) or CONT_LPO.match(ln)):
+                txs[-1]["reference"] += ln
+            continue
+
+        # ── Main transaction line ──────────────────────────────────────────
+        date = _parse_date_sc(parts[0])
+        rest = parts[1:]
+
+        doc_idx = next((j for j,p in enumerate(rest) if DOC_SC.match(p)), None)
+        if doc_idx is None: continue
+
+        doc_no  = rest[doc_idx]
+        pre_doc = rest[:doc_idx]
+
+        # Veh Reg: last token before doc_no if it matches pattern
+        if pre_doc and VEH_SC.match(pre_doc[-1]):
+            veh_reg = pre_doc[-1]; ref_parts = pre_doc[:-1]
+        else:
+            veh_reg = "";           ref_parts = pre_doc
+
+        reference = " ".join(ref_parts)
+        after = rest[doc_idx+1:]
+
+        # CU Invoice (19-digit)
+        cu_idx = next((j for j,p in enumerate(after) if CU_SC.match(p)), None)
+        if cu_idx is not None:
+            cu_inv = after[cu_idx]; after2 = after[cu_idx+1:]
+        else:
+            cu_inv = "";            after2 = after
+
+        # Parse from right: balance, rem_amt, orig_amt, due_date, description
+        nums_i  = [j for j,p in enumerate(after2) if MONEY_SC.match(p)]
+        dates_i = [j for j,p in enumerate(after2) if DATE_SC.match(p)]
+
+        if len(nums_i) < 3: continue
+
+        balance  = pnf(after2[nums_i[-1]])
+        rem_amt  = pnf(after2[nums_i[-2]])
+        orig_amt = pnf(after2[nums_i[-3]])
+        due_date = _parse_date_sc(after2[dates_i[-1]]) if dates_i else None
+
+        cutoff   = dates_i[-1] if dates_i else nums_i[-3]
+        description = " ".join(after2[:cutoff])
+
+        # Consume continuation lines for this entry
+        while i < len(lines):
+            nxt = lines[i].strip()
+            if not nxt: i += 1; continue
+            nxt_p = nxt.split()
+            if DATE_SC.match(nxt_p[0]): break
+            if _skip_sc(nxt): break
+            if CONT_SC.match(nxt) or CONT_LPO.match(nxt):
+                reference += nxt; i += 1
+            else:
+                break
+
+        txs.append(dict(date=date, reference=reference, veh_reg=veh_reg,
+                        doc_no=doc_no, cu_inv=cu_inv, description=description,
+                        due_date=due_date, orig_amt=orig_amt,
+                        rem_amt=rem_amt, balance=balance))
+
+    return hdr, txs, ageing
+
+
+def excel_simba(hdr, txs, ageing):
+    """Excel builder for Simba Corporation statement.
+    Columns: Posting Date | Reference | Veh Reg | Document No. | CU Invoice No.
+             | Description | Due Date | Original Amount | Remaining Amount | Balance
+    + Ageing Summary sheet.
+    """
+    SIMBA_BLUE  = "1A3A5C"   # Simba Corp deep navy
+    SIMBA_LIGHT = "E8F0F7"
+    SIMBA_RED   = "C00000"
+
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws.title = "Simba Statement"
+    ws.sheet_properties.tabColor = SIMBA_BLUE
+
+    col_widths = [14, 26, 10, 14, 22, 26, 14, 18, 18, 18]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # ── Banner ────────────────────────────────────────────────────────────────
+    ws.merge_cells("A1:J1")
+    c = ws["A1"]
+    c.value = "SIMBA CORPORATION LIMITED  |  CUSTOMER STATEMENT"
+    c.font  = Font(name="Arial", bold=True, size=13, color="FFFFFF")
+    c.fill  = PatternFill("solid", start_color=SIMBA_BLUE)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    # ── Info block ────────────────────────────────────────────────────────────
+    lf = Font(name="Arial", bold=True, size=9)
+    vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [
+        ("Customer",      hdr.get("customer",""),    "Customer No.", hdr.get("customer_no","")),
+        ("Supplier",      hdr.get("supplier",""),     "Statement No.",hdr.get("statement_no","")),
+        ("Document Date", hdr.get("doc_date",""),     "Start Date",   hdr.get("start_date","")),
+        ("End Date",      hdr.get("end_date",""),     "",             ""),
+    ]
+    for r, (l1,v1,l2,v2) in enumerate(info, start=2):
+        for ci,lbl,val in [(1,l1,v1),(6,l2,v2)]:
+            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci+2)
+            ws.merge_cells(start_row=r, start_column=ci+3, end_row=r, end_column=ci+4)
+            lc = ws.cell(row=r,column=ci,   value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
+            vc = ws.cell(row=r,column=ci+3, value=val); vc.font=vf; vc.alignment=al
+        ws.row_dimensions[r].height = 16
+
+    # ── Column headers ────────────────────────────────────────────────────────
+    H = 6
+    hdrs = ["Posting Date","Reference","Veh Reg","Document No.","CU Invoice No.",
+            "Description","Due Date","Original Amount","Remaining Amount","Balance"]
+    for ci, h in enumerate(hdrs, 1):
+        wc(ws, H, ci, h, bold=True, fg="FFFFFF", bg=SIMBA_BLUE, align="center", bdr=thin())
+    ws.row_dimensions[H].height = 22
+
+    # ── Data rows ─────────────────────────────────────────────────────────────
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_credit  = (tx["orig_amt"] or 0) < 0
+        is_whtvat  = "WHTVAT" in str(tx.get("description","")).upper() or                      "VAT" in str(tx.get("description","")).upper()
+        bg = SIMBA_LIGHT if is_whtvat else (C["receipt_bg"] if is_credit else
+                                            (C["alt_row"] if (ri-D)%2==1 else None))
+
+        bal  = tx["balance"] or 0
+        fg_orig = SIMBA_RED  if is_credit else C["debit_fg"]
+        fg_rem  = SIMBA_RED  if is_credit else C["debit_fg"]
+        fg_bal  = SIMBA_RED  if bal < 0   else C["credit_fg"]
+
+        vals   = [tx["date"], tx["reference"], tx["veh_reg"] or "",
+                  tx["doc_no"], tx["cu_inv"] or "", tx["description"],
+                  tx["due_date"], tx["orig_amt"], tx["rem_amt"], tx["balance"]]
+        aligns = ["center","left","center","center","center","left",
+                  "center","right","right","right"]
+        fmts   = [DATE_FMT,None,None,None,None,None,DATE_FMT,MFMT,MFMT,MFMT]
+        fgs    = ["000000","000000","555555","000000","555555","000000",
+                  "000000",fg_orig,fg_rem,fg_bal]
+
+        for ci,(v,a,f,fg) in enumerate(zip(vals,aligns,fmts,fgs),1):
+            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
+        ws.row_dimensions[ri].height = 15
+
+    # ── Totals row ────────────────────────────────────────────────────────────
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:G{T}")
+    wc(ws,T,1,"TOTAL KES",bold=True,fg="FFFFFF",bg=SIMBA_BLUE,align="right",bdr=thin(),ind=1)
+    for ci, col in [(8,"H"),(9,"I"),(10,"J")]:
+        c = ws.cell(row=T, column=ci, value=f"=SUM({col}{D}:{col}{T-1})")
+        c.font = Font(name="Arial",bold=True,size=9,color="FFFFFF")
+        c.fill = PatternFill("solid",start_color=SIMBA_BLUE)
+        c.number_format = MFMT
+        c.alignment = Alignment(horizontal="right",vertical="center")
+        c.border = thin()
+    ws.row_dimensions[T].height = 18
+
+    ws.freeze_panes = f"A{D}"
+    ws.auto_filter.ref = f"A{H}:J{T-1}"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToPage   = True
+    ws.page_setup.fitToWidth  = 1
+
+    # ── Ageing Summary sheet ──────────────────────────────────────────────────
+    if ageing:
+        ws2 = wb.create_sheet("Ageing Summary"); ws2.sheet_properties.tabColor = SIMBA_BLUE
+        ws2.column_dimensions["A"].width = 28; ws2.column_dimensions["B"].width = 20
+        ws2.merge_cells("A1:B1")
+        wc(ws2,1,1,"AGED SUMMARY",bold=True,fg="FFFFFF",bg=SIMBA_BLUE,align="center",sz=12)
+        ws2.row_dimensions[1].height = 26
+        for ci,h in enumerate(["Ageing Bucket","Amount (KES)"],1):
+            wc(ws2,2,ci,h,bold=True,fg="FFFFFF",bg=SIMBA_BLUE,align="center",bdr=thin())
+        ws2.row_dimensions[2].height = 20
+        labels = {"0_30":"0–30 Days to Due","31_60":"31–60 Days to Due",
+                  "61_91":"61–91 Days to Due","92_121":"92–121 Days to Due",
+                  "over_121":"Over 121 Days","amount_due":"Total Amount Due"}
+        for ri,(key,lbl) in enumerate(labels.items(),start=3):
+            val  = ageing.get(key)
+            bold = key=="amount_due"
+            bg2  = C["info_bg"] if bold else (C["alt_row"] if ri%2==0 else None)
+            fg2  = SIMBA_RED if (val or 0)<0 else ("000000" if not bold else SIMBA_BLUE)
+            wc(ws2,ri,1,lbl,bold=bold,align="left",bdr=thin("bottom"),bg=bg2)
+            wc(ws2,ri,2,val,align="right",fmt=MFMT,bdr=thin("bottom"),fg=fg2,bg=bg2,bold=bold)
+            ws2.row_dimensions[ri].height = 16
+
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+
 def convert(pdf_bytes):
     lines=[]
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -2149,6 +2406,9 @@ def convert(pdf_bytes):
     elif fmt=="coa":
         hdr,debits,credits,ageing=parse_coa(lines)
         return fmt,len(debits)+len(credits),0,pages,excel_coa(hdr,debits,credits,ageing)
+    elif fmt=="simba":
+        hdr,txs,ageing=parse_simba(lines)
+        return fmt,len(txs),0,pages,excel_simba(hdr,txs,ageing)
     return "unknown",0,0,pages,None
 
 
@@ -2715,6 +2975,7 @@ if uploaded:
                 "autoxpress":"AutoXpress Limited","gathani":"Gathani Limited",
                 "anco":"Anco Trading Ltd",
                 "coa":"Confirmation of Accounts",
+                "simba":"Simba Corporation Ltd",
                 "bamburi":"Bamburi Cement PLC",
             }
             label   = labels.get(fmt, fmt)
