@@ -95,7 +95,7 @@ st.markdown("""
   <span class="badge">🩵 Anco Trading</span>
   <span class="badge">🟤 Doshi / Ultra (COA)</span>
   <span class="badge">🟢 Bamburi Cement</span>
-  <span class="badge">🔴 Simba Corporation</span>
+  <span class="badge">🔴 Crown Paints</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
 """, unsafe_allow_html=True)
@@ -117,7 +117,7 @@ with st.expander("🎨 Supported formats"):
 | 🩵 **Anco Trading Ltd** | Transaction · Doc No · Ref No · Doc Date · DR/CR · Debit · Credit · Balance + Ageing Analysis sheet |
 | 🟤 **Doshi / Ultra (COA)** | Two-column layout: Debit (Date · Particulars · CU Invoice · Amount) + Credit (Date · Particulars · Amount) + Ageing Summary |
 | 🟢 **Bamburi Cement PLC** | Doc No · Delivery Note · Posting Date · Doc Type · Item Text/Ref · Qty · Unit · Amount · Running Balance |
-| 🔴 **Simba Corporation** | Posting Date · Reference · Veh Reg · Document No. · CU Invoice No. · Description · Due Date · Original Amount · Remaining Amount · Balance + Aged Summary sheet |
+| 🔴 **Crown Paints Kenya PLC** | Date · Description (A/R Invoice/Credit Memo/Incoming Payment) · Doc No · Reference · Debit · Credit · Cumulative Bal. + Ageing Summary + Product Summary sheets |
     """)
 
 # ── Colours & helpers ──────────────────────────────────────────────────────────
@@ -129,7 +129,7 @@ C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20
          skylife_teal="00838F", springtech_indigo="3F51B5", scania_red="C8102E",
          transsolutions_cyan="0097A7", autoxpress_amber="F57C00",
          gathani_maroon="7B1C1C", anco_teal="00695C", bamburi_green="00843D",
-         simba_red="C8102E")
+         crown_red="C8102E")
 MFMT = '#,##0.00;(#,##0.00);"-"'
 IFMT = '#,##0;(#,##0);"-"'
 
@@ -188,7 +188,7 @@ def totals_row(ws, row, merge_end, label_text, data_cols, bg):
 def detect(lines):
     t = "\n".join(lines[:50])
     tfull = "\n".join(lines[:150])
-    if "SIMBA CORP" in tfull.upper():                                  return "simba"
+    if "CROWN PAINTS" in tfull.upper():                                return "crown"
     if "SKYLIFE" in t.upper():                                        return "skylife"
     if "SPRINGTECH" in t.upper():                                      return "springtech"
     if "TRANS-SOLUTIONS" in t.upper() or "TRANSSOLUTIONS" in t.upper(): return "transsolutions"
@@ -1142,199 +1142,6 @@ def excel_scania(hdr, txs):
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIMBA CORPORATION LIMITED PARSER
-#   Line shape (one physical text line per table row, pdfplumber reading order):
-#     PostingDate [Reference words...] [VehReg?] DocNo [CUInvoiceNo?] [Description words...] DueDate OrigAmt RemAmt Balance
-#   The "Reference" column wraps onto its own following line(s) in the PDF layout
-#   (e.g. "POHH0012604000" then "173" on the next line) — those wrapped fragments
-#   arrive, in reading order, AFTER the rest of the row, so we fold them back
-#   into the reference of the transaction that is currently open.
-# ══════════════════════════════════════════════════════════════════════════════
-DATE_SIM     = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-MONEY_SIM    = re.compile(r"^-?[\d,]+\.\d{2}$")
-DOCNO_SIM    = re.compile(r"^(SPV|SPR|GJVP|CRJP)-?\d+:?$")
-CU_INV_SIM   = re.compile(r"^\d{14,20}$")
-VEHREG_SIM   = re.compile(r"^K[A-Z]{2}\d{3}[A-Z]$")
-SKIP_KW_SIM  = ("Customer Statement", "Simba Corporation Limited", "P.O. Box 48296", "PIN:",
-                "P.O. Box 64126", "Customer No.", "Statement No.", "Document Date",
-                "Starting Date", "Ending Date", "Posting Date Reference", "Aged Summary",
-                "Days to Due Date", "Total KES")
-
-def is_skip_simba(ln):
-    if ln in ("Amount", "NAIROBI", "00620 NAIROBI"): return True
-    if re.search(r"Page\s+\d+$", ln): return True
-    if ln.startswith("KES "): return True
-    return any(kw in ln for kw in SKIP_KW_SIM)
-
-def parse_simba_row(toks):
-    n = len(toks)
-    if n < 5: return None
-    if not (MONEY_SIM.match(toks[-1]) and MONEY_SIM.match(toks[-2]) and MONEY_SIM.match(toks[-3])):
-        return None
-    orig, remaining, balance = pnf(toks[-3]), pnf(toks[-2]), pnf(toks[-1])
-    due_idx = n - 4
-    due_date = toks[due_idx] if due_idx >= 1 and DATE_SIM.match(toks[due_idx]) else ""
-    search_end = due_idx if due_date else n - 3
-    date = toks[0]
-
-    docno_idx = None
-    for j in range(1, search_end):
-        if DOCNO_SIM.match(toks[j]):
-            docno_idx = j; break
-
-    if docno_idx is None:
-        reference = " ".join(toks[1:search_end])
-        return {"date": date, "reference": reference, "veh_reg": "", "doc_no": "", "cu_invoice": "",
-                "description": "", "due_date": due_date, "original": orig, "remaining": remaining, "balance": balance}
-
-    veh_reg = ""
-    ref_end = docno_idx
-    if docno_idx - 1 >= 1 and VEHREG_SIM.match(toks[docno_idx - 1]):
-        veh_reg = toks[docno_idx - 1]
-        ref_end = docno_idx - 1
-    reference = " ".join(toks[1:ref_end])
-    doc_no = toks[docno_idx]
-
-    idx = docno_idx + 1
-    cu_invoice = ""
-    if idx < search_end and CU_INV_SIM.match(toks[idx]):
-        cu_invoice = toks[idx]; idx += 1
-    description = " ".join(toks[idx:search_end])
-
-    return {"date": date, "reference": reference, "veh_reg": veh_reg, "doc_no": doc_no,
-            "cu_invoice": cu_invoice, "description": description, "due_date": due_date,
-            "original": orig, "remaining": remaining, "balance": balance}
-
-def parse_simba(lines):
-    hdr = {"customer": "", "customer_no": "", "statement_no": "", "document_date": "",
-           "starting_date": "", "ending_date": "", "total": None,
-           "buckets": {"d0_30": None, "d31_60": None, "d61_91": None, "d92_121": None, "over121": None},
-           "amount_due": None}
-    full = "\n".join(lines)
-    m = re.search(r"^(.+?)\s+Page\s+\d+", full, re.M)
-    if m: hdr["customer"] = m.group(1).strip()
-    m = re.search(r"Customer No\.\s*(\S+)", full)
-    if m: hdr["customer_no"] = m.group(1)
-    m = re.search(r"Statement No\.\s*(\d+)", full)
-    if m: hdr["statement_no"] = m.group(1)
-    m = re.search(r"Document Date\s*(\d{2}/\d{2}/\d{4})", full)
-    if m: hdr["document_date"] = m.group(1)
-    m = re.search(r"Starting Date\s*(\d{2}/\d{2}/\d{4})", full)
-    if m: hdr["starting_date"] = m.group(1)
-    m = re.search(r"Ending Date\s*(\d{2}/\d{2}/\d{4})", full)
-    if m: hdr["ending_date"] = m.group(1)
-    m = re.search(r"Total KES\s+(-?[\d,]+\.\d{2})", full)
-    if m: hdr["total"] = pnf(m.group(1))
-    m = re.search(r"KES\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+"
-                  r"(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})", full)
-    if m:
-        hdr["buckets"] = {"d0_30": pnf(m.group(1)), "d31_60": pnf(m.group(2)), "d61_91": pnf(m.group(3)),
-                          "d92_121": pnf(m.group(4)), "over121": pnf(m.group(5))}
-        hdr["amount_due"] = pnf(m.group(6))
-
-    txs = []
-    cur = None
-    for raw_ln in lines:
-        ln = raw_ln.strip()
-        if not ln: continue
-        if is_skip_simba(ln):
-            cur = None
-            continue
-        toks = ln.split()
-        if DATE_SIM.match(toks[0]):
-            tx = parse_simba_row(toks)
-            if tx:
-                txs.append(tx); cur = tx
-            else:
-                cur = None
-            continue
-        # continuation fragment of a wrapped Reference column
-        if cur is not None:
-            last_tok = cur["reference"].split()[-1] if cur["reference"] else ""
-            if last_tok.isalpha():
-                cur["reference"] = (cur["reference"] + " " + ln).strip()
-            else:
-                cur["reference"] = (cur["reference"] + ln).strip()
-    return hdr, txs
-
-def excel_simba(hdr, txs):
-    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
-    ws.sheet_properties.tabColor = C["simba_red"]
-    for i, w in enumerate([12, 22, 11, 13, 20, 22, 12, 15, 16, 14], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    banner(ws, 1, 10, "SIMBA CORPORATION LIMITED  |  CUSTOMER STATEMENT", C["simba_red"])
-
-    info = [("Customer", hdr.get("customer", ""), "Customer No.", hdr.get("customer_no", "")),
-            ("Statement No.", hdr.get("statement_no", ""), "Document Date", hdr.get("document_date", "")),
-            ("Starting Date", hdr.get("starting_date", ""), "Ending Date", hdr.get("ending_date", ""))]
-    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
-        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=4)
-        ws.merge_cells(start_row=r, start_column=7, end_row=r, end_column=10)
-        wc(ws, r, 1, l1, bold=True, bg=C["info_bg"], align="left", ind=1)
-        wc(ws, r, 2, v1, align="left")
-        wc(ws, r, 6, l2, bold=True, bg=C["info_bg"], align="left", ind=1)
-        wc(ws, r, 7, v2, align="left")
-        ws.row_dimensions[r].height = 16
-
-    H = 5
-    col_headers(ws, H, ["Posting Date", "Reference", "Veh Reg", "Document No.", "CU Invoice No.",
-                         "Description", "Due Date", "Original Amount (KES)", "Remaining Amount (KES)",
-                         "Balance (KES)"], C["simba_red"])
-    D = H + 1
-    for ri, tx in enumerate(txs, start=D):
-        is_credit = tx["original"] is not None and tx["original"] < 0
-        bg = C["credit_row"] if is_credit else (C["alt_row"] if (ri - D) % 2 == 1 else None)
-        vals = [tx["date"], tx["reference"], tx["veh_reg"], tx["doc_no"], tx["cu_invoice"],
-                 tx["description"], tx["due_date"], tx["original"], tx["remaining"], tx["balance"]]
-        aligns = ["center", "left", "center", "center", "center", "left", "center", "right", "right", "right"]
-        fmts = [None, None, None, None, None, None, None, MFMT, MFMT, MFMT]
-        for ci, (v, a, f) in enumerate(zip(vals, aligns, fmts), 1):
-            fg = "000000"
-            if ci in (8, 9) and v is not None: fg = C["credit_fg"] if v < 0 else C["debit_fg"]
-            if ci == 10 and v is not None: fg = C["neg_bal"] if v < 0 else "000000"
-            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
-        ws.row_dimensions[ri].height = 15
-
-    T = D + len(txs)
-    ws.merge_cells(f"A{T}:G{T}")
-    wc(ws, T, 1, "TOTAL", bold=True, fg=C["col_hdr_fg"], bg=C["simba_red"], align="right", bdr=thin(), ind=1)
-    for ci, col in [(8, "H"), (9, "I")]:
-        c = ws.cell(row=T, column=ci, value=f"=SUM({col}{D}:{col}{T-1})")
-        c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
-        c.fill = PatternFill("solid", start_color=C["simba_red"])
-        c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
-    closing = txs[-1]["balance"] if txs else hdr.get("total")
-    c = ws.cell(row=T, column=10, value=closing)
-    c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
-    c.fill = PatternFill("solid", start_color=C["simba_red"])
-    c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
-    ws.row_dimensions[T].height = 18
-    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:J{T-1}"
-    ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
-
-    b = hdr.get("buckets") or {}
-    if any(v is not None for v in b.values()) or hdr.get("amount_due") is not None:
-        ws2 = wb.create_sheet("Aged Summary"); ws2.sheet_properties.tabColor = C["simba_red"]
-        for col, w in [("A", 26), ("B", 18)]: ws2.column_dimensions[col].width = w
-        ws2.merge_cells("A1:B1")
-        wc(ws2, 1, 1, "AGED SUMMARY (by Due Date)", bold=True, fg=C["col_hdr_fg"], bg=C["simba_red"],
-           align="center", sz=12)
-        ws2.row_dimensions[1].height = 26
-        rows2 = [("0 - 30 Days to Due Date", b.get("d0_30")),
-                 ("31 - 60 Days to Due Date", b.get("d31_60")),
-                 ("61 - 91 Days to Due Date", b.get("d61_91")),
-                 ("92 - 121 Days to Due Date", b.get("d92_121")),
-                 ("Over 121 Days", b.get("over121")),
-                 ("Amount Due", hdr.get("amount_due"))]
-        for ri, (lbl, val) in enumerate(rows2, start=2):
-            bold = lbl == "Amount Due"
-            wc(ws2, ri, 1, lbl, bold=bold, align="left", bdr=thin("bottom"), bg=C["info_bg"] if bold else None)
-            wc(ws2, ri, 2, val, align="right", fmt=MFMT, bdr=thin("bottom"),
-               fg=C["neg_bal"] if (val or 0) < 0 else "000000", bg=C["info_bg"] if bold else None)
-            ws2.row_dimensions[ri].height = 16
-    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
-
-# ══════════════════════════════════════════════════════════════════════════════
 # BAMBURI CEMENT PLC PARSER
 #   Line shape (single physical line per pdfplumber, one row of the table):
 #     [DocNo] [DeliveryNote?] Mon DD, YYYY  DocType(1-3 words)  ItemText/PO/Truck...  [Qty Unit]  Amount  Balance
@@ -2043,6 +1850,255 @@ def excel_anco(hdr, txs):
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# CROWN PAINTS KENYA PLC PARSER
+# Format: Date | Description (A/R Invoice / A/R Credit Memo / Incoming Payment) |
+#         Doc No | Reference | Debit | Credit | Cumulative Bal.
+# Also captures: header info, closing ageing summary, and the "Product Wise
+# Group Summary" table at the foot of the statement.
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_CRN  = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{2}$")
+MONEY_CRN = re.compile(r"^-?[\d,]+\.\d{2}$")
+DESC_CRN  = ("A/R Credit Memo", "A/R Invoice", "Incoming Payment")  # longest-match first
+
+def parse_crown(lines):
+    full = "\n".join(lines)
+    hdr = {"supplier": "Crown Paints Kenya PLC", "account_code": "", "customer": "",
+           "period_from": "", "period_to": "", "credit_limit": None, "credit_days": "",
+           "opening_balance": None, "total_debit": None, "total_credit": None,
+           "total_outstanding": None, "ageing": {}}
+
+    m = re.search(r"\b(RCNE\d+)\b", full)
+    if m: hdr["account_code"] = m.group(1)
+
+    m = re.search(r"\b(?:RCNE\d+\s+)?([A-Z][A-Z0-9 &/.,'()-]{5,}(?:LTD|LIMITED))\b", full)
+    if m: hdr["customer"] = m.group(1).strip()
+
+    m = re.search(r"(\d{1,2}-[A-Za-z]{3}-\d{4})\s*(?:TO)?\s*[\r\n]*\s*(?:TO\s*)?(\d{1,2}-[A-Za-z]{3}-\d{4})", full)
+    if m: hdr["period_from"], hdr["period_to"] = m.group(1), m.group(2)
+
+    m = re.search(r"Credit Limit\s+([\d,]+\.\d{2})", full)
+    if not m:
+        m = re.search(r"([\d,]+\.\d{2})\s*[\r\n]+\s*Credit Limit", full)
+    if m: hdr["credit_limit"] = pnf(m.group(1))
+
+    m = re.search(r"(\d+\s+Days From Statement)", full)
+    if m: hdr["credit_days"] = m.group(1)
+
+    m = re.search(r"Opening Balance\s+([\d,]+\.\d{2})", full)
+    if m: hdr["opening_balance"] = pnf(m.group(1))
+
+    m = re.search(r"Total\s*[\r\n]+\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})", full)
+    if m: hdr["total_debit"], hdr["total_credit"] = pnf(m.group(1)), pnf(m.group(2))
+
+    m = re.search(r"Total Outstanding Balance:\s*[\r\n]*\s*([\d,]+\.\d{2})", full)
+    if m: hdr["total_outstanding"] = pnf(m.group(1))
+
+    m = re.search(
+        r"0\s*-\s*30 Days\s+31\s*-\s*60 Days\s+61\s*-\s*90 Days\s+91-120 Days\s+121\s*\+\s*Days\s+Amount Due\s*"
+        r"([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})",
+        full)
+    if m:
+        keys = ["0_30", "31_60", "61_90", "91_120", "121_plus", "amount_due"]
+        for k, v in zip(keys, m.groups()): hdr["ageing"][k] = pnf(v)
+
+    # Product-wise summary rows (e.g. "ADHE-ADHESIVE 141.00 0.00 141.00 53,738.50 0.00 53,738.50")
+    products = []
+    for ln in lines:
+        pm = re.match(
+            r"^([A-Z]{2,6}-[A-Z0-9 /]+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+"
+            r"([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$", ln.strip())
+        if pm:
+            products.append({
+                "category": pm.group(1).strip(),
+                "sales_volume": pnf(pm.group(2)), "return_volume": pnf(pm.group(3)),
+                "net_volume": pnf(pm.group(4)), "sales_amount": pnf(pm.group(5)),
+                "return_amount": pnf(pm.group(6)), "net_amount": pnf(pm.group(7)),
+            })
+
+    txs = []
+    if hdr["opening_balance"] is not None:
+        txs.append({"date": "--", "desc": "Opening Balance", "doc_no": "", "reference": "",
+                    "debit": None, "credit": None, "balance": hdr["opening_balance"], "is_opening": True})
+
+    def trailing_money_count(tokens):
+        idx = len(tokens)
+        while idx > 0 and MONEY_CRN.match(tokens[idx - 1]):
+            idx -= 1
+        return len(tokens) - idx
+
+    n = len(lines)
+    i = 0
+    while i < n:
+        ln = lines[i].strip()
+        if not ln:
+            i += 1; continue
+        parts = ln.split()
+        if not parts or not DATE_CRN.match(parts[0]):
+            i += 1; continue
+
+        date = parts[0]
+        rest_line = ln[len(parts[0]):].strip()
+        desc = None
+        rest_after_desc = ""
+        for kw in DESC_CRN:
+            if rest_line.startswith(kw):
+                desc = kw
+                rest_after_desc = rest_line[len(kw):].strip()
+                break
+        if desc is None:
+            i += 1; continue
+
+        tok = rest_after_desc.split()
+        doc_no = tok[0] if tok else ""
+        collected = tok[1:]
+
+        j = i + 1
+        while trailing_money_count(collected) < 3 and j < n:
+            nxt = lines[j].strip()
+            if not nxt:
+                j += 1; continue
+            nparts = nxt.split()
+            if DATE_CRN.match(nparts[0]) or nparts[0] == "Total" or "Total Outstanding" in nxt:
+                break
+            collected.extend(nparts)
+            j += 1
+
+        if len(collected) >= 3 and all(MONEY_CRN.match(x) for x in collected[-3:]):
+            money_tokens = collected[-3:]
+            reference_tokens = collected[:-3]
+        else:
+            money_tokens = []
+            reference_tokens = collected
+
+        reference = " ".join(reference_tokens).strip()
+        debit = credit = balance = None
+        if len(money_tokens) == 3:
+            debit, credit, balance = pnf(money_tokens[0]), pnf(money_tokens[1]), pnf(money_tokens[2])
+
+        txs.append({"date": date, "desc": desc, "doc_no": doc_no, "reference": reference,
+                    "debit": debit, "credit": credit, "balance": balance, "is_opening": False})
+        i = j if j > i + 1 else i + 1
+
+    return hdr, txs, products
+
+def excel_crown(hdr, txs, products):
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws.title = "Statement"; ws.sheet_properties.tabColor = C["crown_red"]
+    for i, w in enumerate([12, 16, 12, 32, 16, 14, 18], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    banner(ws, 1, 7, "CROWN PAINTS KENYA PLC  |  CUSTOMER STATEMENT", C["crown_red"])
+
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    period = f"{hdr.get('period_from','')} to {hdr.get('period_to','')}".strip(" to")
+    info = [
+        ("Customer", hdr.get("customer", ""), "Account Code", hdr.get("account_code", "")),
+        ("Period", period, "Credit Days", hdr.get("credit_days", "")),
+        ("Credit Limit",
+         f"KES {hdr['credit_limit']:,.2f}" if hdr.get("credit_limit") is not None else "",
+         "Opening Balance",
+         f"{hdr['opening_balance']:,.2f}" if hdr.get("opening_balance") is not None else ""),
+    ]
+    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
+        for ci, lbl, val in [(1, l1, v1), (5, l2, v2)]:
+            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci + 1)
+            lc = ws.cell(row=r, column=ci, value=lbl); lc.font = lf; lc.fill = lb; lc.alignment = al
+            vc = ws.cell(row=r, column=ci + 2, value=val); vc.font = vf; vc.alignment = al
+        ws.row_dimensions[r].height = 16
+
+    H = 6
+    col_headers(ws, H, ["Date", "Description", "Doc No", "Reference",
+                         "Debit (KES)", "Credit (KES)", "Cumulative Bal. (KES)"], C["crown_red"])
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_open = tx.get("is_opening", False)
+        is_cr = tx["desc"] in ("A/R Credit Memo", "Incoming Payment") and not is_open
+        bg = C["info_bg"] if is_open else (C["credit_row"] if is_cr else (C["alt_row"] if (ri - D) % 2 == 1 else None))
+        vals = [tx["date"], tx["desc"], tx["doc_no"], tx["reference"], tx["debit"], tx["credit"], tx["balance"]]
+        aligns = ["center", "center", "center", "left", "right", "right", "right"]
+        fmts = [None, None, None, None, MFMT, MFMT, MFMT]
+        for ci, (v, a, f) in enumerate(zip(vals, aligns, fmts), 1):
+            fg = "000000"
+            if ci == 5 and v is not None: fg = C["debit_fg"]
+            if ci == 6 and v is not None: fg = C["credit_fg"]
+            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
+        ws.row_dimensions[ri].height = 15
+
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:D{T}")
+    wc(ws, T, 1, "TOTAL", bold=True, fg=C["col_hdr_fg"], bg=C["crown_red"], align="right", bdr=thin(), ind=1)
+    for ci, col in [(5, "E"), (6, "F")]:
+        c = ws.cell(row=T, column=ci, value=f"=SUM({col}{D}:{col}{T - 1})")
+        c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+        c.fill = PatternFill("solid", start_color=C["crown_red"])
+        c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    last_bal = txs[-1]["balance"] if txs else hdr.get("total_outstanding")
+    c = ws.cell(row=T, column=7, value=last_bal)
+    c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+    c.fill = PatternFill("solid", start_color=C["crown_red"])
+    c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    ws.row_dimensions[T].height = 18
+
+    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:G{T - 1}"
+    ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
+
+    # Ageing Summary sheet
+    ag = hdr.get("ageing", {})
+    if any(v is not None for v in ag.values()):
+        ws2 = wb.create_sheet("Ageing Summary"); ws2.sheet_properties.tabColor = C["crown_red"]
+        for col, w in [("A", 22), ("B", 18)]: ws2.column_dimensions[col].width = w
+        ws2.merge_cells("A1:B1")
+        wc(ws2, 1, 1, "AGEING SUMMARY", bold=True, fg=C["col_hdr_fg"], bg=C["crown_red"], align="center", sz=12)
+        ws2.row_dimensions[1].height = 26
+        rows2 = [
+            ("0 - 30 Days", ag.get("0_30")),
+            ("31 - 60 Days", ag.get("31_60")),
+            ("61 - 90 Days", ag.get("61_90")),
+            ("91 - 120 Days", ag.get("91_120")),
+            ("121+ Days", ag.get("121_plus")),
+            ("Amount Due", ag.get("amount_due")),
+        ]
+        for ri, (lbl, val) in enumerate(rows2, start=2):
+            bold = lbl == "Amount Due"
+            bg2 = C["info_bg"] if bold else None
+            wc(ws2, ri, 1, lbl, bold=bold, align="left", bdr=thin("bottom"), bg=bg2)
+            wc(ws2, ri, 2, val, align="right", fmt=MFMT, bdr=thin("bottom"),
+               fg=C["neg_bal"] if (val or 0) < 0 else "000000", bg=bg2)
+            ws2.row_dimensions[ri].height = 16
+
+    # Product Summary sheet
+    if products:
+        ws3 = wb.create_sheet("Product Summary"); ws3.sheet_properties.tabColor = C["crown_red"]
+        for i, w in enumerate([26, 14, 14, 14, 16, 16, 16], 1):
+            ws3.column_dimensions[get_column_letter(i)].width = w
+        banner(ws3, 1, 7, "PRODUCT-WISE GROUP SUMMARY", C["crown_red"])
+        col_headers(ws3, 2, ["Category", "Sales Volume", "Return Volume", "Net Volume",
+                              "Sales Amount (KES)", "Return Amount (KES)", "Net Amount (KES)"], C["crown_red"])
+        for ri, p in enumerate(products, start=3):
+            bg = C["alt_row"] if (ri - 3) % 2 == 1 else None
+            vals = [p["category"], p["sales_volume"], p["return_volume"], p["net_volume"],
+                    p["sales_amount"], p["return_amount"], p["net_amount"]]
+            aligns = ["left", "right", "right", "right", "right", "right", "right"]
+            fmts = [None, IFMT, IFMT, IFMT, MFMT, MFMT, MFMT]
+            for ci, (v, a, f) in enumerate(zip(vals, aligns, fmts), 1):
+                wc(ws3, ri, ci, v, align=a, fmt=f, bdr=thin("bottom"), bg=bg)
+            ws3.row_dimensions[ri].height = 15
+        T3 = 3 + len(products)
+        wc(ws3, T3, 1, "TOTAL", bold=True, fg=C["col_hdr_fg"], bg=C["crown_red"], align="right", bdr=thin())
+        for ci, col in [(2, "B"), (3, "C"), (4, "D"), (5, "E"), (6, "F"), (7, "G")]:
+            c = ws3.cell(row=T3, column=ci, value=f"=SUM({col}3:{col}{T3 - 1})")
+            c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+            c.fill = PatternFill("solid", start_color=C["crown_red"])
+            c.number_format = IFMT if ci in (2, 3, 4) else MFMT
+            c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+        ws3.freeze_panes = "A3"; ws3.auto_filter.ref = f"A2:G{T3 - 1}"
+        ws3.page_setup.orientation = "landscape"; ws3.page_setup.fitToPage = True; ws3.page_setup.fitToWidth = 1
+
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIRMATION OF ACCOUNTS PARSER
@@ -2346,9 +2402,9 @@ def convert(pdf_bytes):
     elif fmt=="coa":
         hdr,debits,credits,ageing=parse_coa(lines)
         return fmt,len(debits)+len(credits),0,pages,excel_coa(hdr,debits,credits,ageing)
-    elif fmt=="simba":
-        hdr,txs=parse_simba(lines)
-        return fmt,len(txs),0,pages,excel_simba(hdr,txs)
+    elif fmt=="crown":
+        hdr,txs,products=parse_crown(lines)
+        return fmt,len(txs),0,pages,excel_crown(hdr,txs,products)
     return "unknown",0,0,pages,None
 
 
@@ -2916,7 +2972,7 @@ if uploaded:
                 "anco":"Anco Trading Ltd",
                 "coa":"Confirmation of Accounts",
                 "bamburi":"Bamburi Cement PLC",
-                "simba":"Simba Corporation Limited",
+                "crown":"Crown Paints Kenya PLC",
             }
             label   = labels.get(fmt, fmt)
             chq_txt = f" · {chq_count} cheques" if chq_count else ""
