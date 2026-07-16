@@ -96,6 +96,7 @@ st.markdown("""
   <span class="badge">🟤 Doshi / Ultra (COA)</span>
   <span class="badge">🟢 Bamburi Cement</span>
   <span class="badge">🔴 Crown Paints</span>
+  <span class="badge">🔷 Mapei East Africa</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
 """, unsafe_allow_html=True)
@@ -118,6 +119,7 @@ with st.expander("🎨 Supported formats"):
 | 🟤 **Doshi / Ultra (COA)** | Two-column layout: Debit (Date · Particulars · CU Invoice · Amount) + Credit (Date · Particulars · Amount) + Ageing Summary |
 | 🟢 **Bamburi Cement PLC** | Doc No · Delivery Note · Posting Date · Doc Type · Item Text/Ref · Qty · Unit · Amount · Running Balance |
 | 🔴 **Crown Paints Kenya PLC** | Date · Description (A/R Invoice/Credit Memo/Incoming Payment) · Doc No · Reference · Debit · Credit · Cumulative Bal. + Ageing Summary + Product Summary sheets |
+| 🔷 **Mapei East Africa Ltd** | Date · Invoice · Description · Due Date · Debit · Credit · Balance (credits shown as negatives; wrapped descriptions handled) |
     """)
 
 # ── Colours & helpers ──────────────────────────────────────────────────────────
@@ -129,7 +131,7 @@ C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20
          skylife_teal="00838F", springtech_indigo="3F51B5", scania_red="C8102E",
          transsolutions_cyan="0097A7", autoxpress_amber="F57C00",
          gathani_maroon="7B1C1C", anco_teal="00695C", bamburi_green="00843D",
-         crown_red="C8102E")
+         crown_red="C8102E", mapei_blue="005CA9")
 MFMT = '#,##0.00;(#,##0.00);"-"'
 IFMT = '#,##0;(#,##0);"-"'
 
@@ -188,6 +190,7 @@ def totals_row(ws, row, merge_end, label_text, data_cols, bg):
 def detect(lines):
     t = "\n".join(lines[:50])
     tfull = "\n".join(lines[:150])
+    if "MAPEI" in tfull.upper():                                       return "mapei"
     if "CROWN PAINTS" in tfull.upper():                                return "crown"
     if "SKYLIFE" in t.upper():                                        return "skylife"
     if "SPRINGTECH" in t.upper():                                      return "springtech"
@@ -1137,6 +1140,190 @@ def excel_scania(hdr, txs):
     c.fill = PatternFill("solid", start_color=C["scania_red"])
     c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
     ws.row_dimensions[T].height = 18
+    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:G{T-1}"
+    ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAPEI EAST AFRICA LTD PARSER
+# Format: Date | Invoice | Description | Due | Currency | Debit | Credit | Balance
+#   e.g. "24/10/2024 24SI001356 22/01/2025 KES 704.90 0.00 704.90"
+# Quirks handled:
+#   • Credits appear as NEGATIVE numbers in the Credit column (e.g. -2,046,703.00)
+#   • Long descriptions (VAT withholding certs, incoming payments) wrap onto the
+#     line(s) ABOVE the transaction line, e.g.:
+#         Incoming pmt_New
+#         15/02/2026 Muthokinju_RTGS 15/02/2026 KES 0.00 -8,073.00 1,424,419.20
+#   • "Opening balance KES 0.00" / "Closing balance KES 14,300,685.89" summary lines
+#   • Header info split across letterhead lines (Customer account, Terms of
+#     payment, Credit limit, Credit available, From/To date, Tax reg number)
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_MPI  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+MONEY_MPI = re.compile(r"^-?[\d,]+\.\d{2}$")
+INV_MPI   = re.compile(r"^\d{2}[A-Z]{2}\d{4,}$")   # e.g. 24SI001356, 26CC000018
+SKIP_MPI  = ("Mapei East Africa", "Account statement", "Riverside", "Wing A",
+             "Page Page", "Date and time", "Telephone", "Fax", "BACS / CHAPS",
+             "Tax registration number", "Customer account", "Terms of payment",
+             "Currency KES", "From date", "To date", "Credit limit",
+             "Credit available", "P.O. BOX", "P.O.BOX",
+             "Date Invoice Description")
+
+def parse_mapei(lines):
+    hdr = {"supplier": "Mapei East Africa Ltd.", "customer": "", "account": "",
+           "terms": "", "currency": "KES", "credit_limit": None,
+           "credit_available": None, "from_date": "", "to_date": "",
+           "tax_reg": "", "statement_datetime": "",
+           "opening_balance": None, "closing_balance": None}
+    for ln in lines:
+        m = re.search(r"^(.*?)\s*Customer account\s+(\S+)", ln)
+        if m:
+            hdr["account"] = m.group(2)
+            if m.group(1).strip(): hdr["customer"] = m.group(1).strip()
+        m = re.search(r"Terms of payment\s+(.+)$", ln)
+        if m: hdr["terms"] = m.group(1).strip()
+        m = re.search(r"From date\s+([\d/]+)", ln)
+        if m: hdr["from_date"] = m.group(1)
+        m = re.search(r"To date\s+([\d/]+)", ln)
+        if m: hdr["to_date"] = m.group(1)
+        m = re.search(r"Credit limit\s+([\d,]+\.\d{2})", ln)
+        if m: hdr["credit_limit"] = pnf(m.group(1))
+        m = re.search(r"Credit available\s+([\d,]+\.\d{2})", ln)
+        if m: hdr["credit_available"] = pnf(m.group(1))
+        m = re.search(r"Tax registration number\s+(\S+)", ln)
+        if m: hdr["tax_reg"] = m.group(1)
+        m = re.search(r"Date and time\s+([\d/]+\s+[\d:]+)", ln)
+        if m: hdr["statement_datetime"] = m.group(1)
+
+    txs = []; pending_desc = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln: continue
+
+        if ln.startswith("Opening balance"):
+            m = re.search(r"(-?[\d,]+\.\d{2})\s*$", ln)
+            if m:
+                hdr["opening_balance"] = pnf(m.group(1))
+                txs.append({"date": "--", "invoice": "", "description": "Opening balance",
+                            "due_date": "", "debit": None, "credit": None,
+                            "balance": hdr["opening_balance"], "is_summary": True})
+            pending_desc = []; continue
+        if ln.startswith("Closing balance"):
+            m = re.search(r"(-?[\d,]+\.\d{2})\s*$", ln)
+            if m: hdr["closing_balance"] = pnf(m.group(1))
+            pending_desc = []; continue
+
+        if any(k in ln for k in SKIP_MPI):
+            pending_desc = []; continue
+        # standalone letterhead city/country lines
+        if ln in ("Nairobi", "Kenya", "NAIROBI", "Original"):
+            pending_desc = []; continue
+
+        parts = ln.split()
+        if not DATE_MPI.match(parts[0]):
+            # wrapped description line — appears ABOVE its transaction line
+            if not any(MONEY_MPI.match(p) for p in parts):
+                pending_desc.append(ln)
+            else:
+                pending_desc = []
+            continue
+
+        # Transaction line: DATE [invoice?] [desc tokens...] DUE_DATE KES DEBIT CREDIT BALANCE
+        date = parts[0]; rest = parts[1:]
+        try:
+            kes_idx = rest.index("KES")
+        except ValueError:
+            pending_desc = []; continue
+        money = rest[kes_idx+1:]
+        debit   = pnf(money[0]) if len(money) > 0 else None
+        credit  = pnf(money[1]) if len(money) > 1 else None
+        balance = pnf(money[2]) if len(money) > 2 else None
+
+        mid = rest[:kes_idx]
+        due_date = ""
+        if mid and DATE_MPI.match(mid[-1]):
+            due_date = mid[-1]; mid = mid[:-1]
+
+        invoice = ""
+        if mid and INV_MPI.match(mid[0]):
+            invoice = mid[0]; mid = mid[1:]
+
+        desc = " ".join(pending_desc + mid).strip()
+        pending_desc = []
+        if not desc:
+            desc = "Credit Note" if (credit or 0) != 0 else "Invoice"
+
+        txs.append({"date": date, "invoice": invoice, "description": desc,
+                    "due_date": due_date, "debit": debit, "credit": credit,
+                    "balance": balance, "is_summary": False})
+    return hdr, txs
+
+def excel_mapei(hdr, txs):
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
+    ws.sheet_properties.tabColor = C["mapei_blue"]
+    for i, w in enumerate([13, 14, 34, 13, 16, 16, 18], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    banner(ws, 1, 7, "MAPEI EAST AFRICA LTD  |  ACCOUNT STATEMENT", C["mapei_blue"])
+
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    cl = hdr.get("credit_limit"); ca = hdr.get("credit_available")
+    info = [("Customer", hdr.get("customer", ""), "Account No.", hdr.get("account", "")),
+            ("Terms", hdr.get("terms", ""), "Tax Reg.", hdr.get("tax_reg", "")),
+            ("From Date", hdr.get("from_date", ""), "To Date", hdr.get("to_date", "")),
+            ("Credit Limit", f"KES {cl:,.2f}" if cl is not None else "",
+             "Credit Available", f"KES {ca:,.2f}" if ca is not None else ""),
+            ("Statement Date", hdr.get("statement_datetime", ""), "Currency", hdr.get("currency", "KES"))]
+    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
+        for ci, lbl, val in [(1, l1, v1), (4, l2, v2)]:
+            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci)
+            ws.merge_cells(start_row=r, start_column=ci+1, end_row=r, end_column=ci+2)
+            lc = ws.cell(row=r, column=ci, value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
+            vc = ws.cell(row=r, column=ci+1, value=val); vc.font=vf; vc.alignment=al
+        ws.row_dimensions[r].height = 16
+
+    H = 7
+    col_headers(ws, H, ["Date", "Invoice", "Description", "Due Date",
+                         "Debit (KES)", "Credit (KES)", "Balance (KES)"], C["mapei_blue"])
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_sum = tx["is_summary"]
+        is_cr  = (tx["credit"] or 0) != 0
+        bg = C["info_bg"] if is_sum else (C["credit_row"] if is_cr else (C["alt_row"] if (ri-D) % 2 == 1 else None))
+        if is_sum:
+            ws.merge_cells(start_row=ri, start_column=1, end_row=ri, end_column=4)
+            wc(ws, ri, 1, tx["description"], bold=True, align="right", bg=bg, bdr=thin("bottom"), ind=1)
+            wc(ws, ri, 5, None, bg=bg, bdr=thin("bottom"))
+            wc(ws, ri, 6, None, bg=bg, bdr=thin("bottom"))
+            wc(ws, ri, 7, tx["balance"], bold=True, align="right", fmt=MFMT, bg=bg, bdr=thin("bottom"))
+        else:
+            vals = [tx["date"], tx["invoice"], tx["description"], tx["due_date"],
+                    tx["debit"], tx["credit"], tx["balance"]]
+            aligns = ["center", "center", "left", "center", "right", "right", "right"]
+            fmts = [None, None, None, None, MFMT, MFMT, MFMT]
+            fgs = ["000000"]*4 + [C["debit_fg"], C["credit_fg"], "000000"]
+            for ci, (v, a, f, fg) in enumerate(zip(vals, aligns, fmts, fgs), 1):
+                if ci == 7 and v is not None: fg = C["neg_bal"] if v < 0 else "000000"
+                wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
+        ws.row_dimensions[ri].height = 15
+
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:D{T}")
+    wc(ws, T, 1, "TOTAL / CLOSING BALANCE", bold=True, fg=C["col_hdr_fg"], bg=C["mapei_blue"],
+       align="right", bdr=thin(), ind=1)
+    for ci, col in [(5, "E"), (6, "F")]:
+        c = ws.cell(row=T, column=ci, value=f"=SUM({col}{D}:{col}{T-1})")
+        c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+        c.fill = PatternFill("solid", start_color=C["mapei_blue"])
+        c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    closing = hdr.get("closing_balance")
+    if closing is None and txs: closing = txs[-1]["balance"]
+    c = ws.cell(row=T, column=7, value=closing)
+    c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+    c.fill = PatternFill("solid", start_color=C["mapei_blue"])
+    c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    ws.row_dimensions[T].height = 18
+
     ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:G{T-1}"
     ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
@@ -2387,6 +2574,9 @@ def convert(pdf_bytes):
     elif fmt=="scania":
         hdr,txs=parse_scania(lines)
         return fmt,len(txs),0,pages,excel_scania(hdr,txs)
+    elif fmt=="mapei":
+        hdr,txs=parse_mapei(lines)
+        return fmt,len(txs),0,pages,excel_mapei(hdr,txs)
     elif fmt=="autoxpress":
         hdr,txs=parse_autoxpress(lines)
         return fmt,len(txs),0,pages,excel_autoxpress(hdr,txs)
@@ -2753,10 +2943,6 @@ def convert_ai(pdf_bytes: bytes, filename: str, api_key: str):
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════════
-# UI
-# ══════════════════════════════════════════════════════════════════════════════
-
 # ── Extra CSS ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
@@ -2973,6 +3159,7 @@ if uploaded:
                 "coa":"Confirmation of Accounts",
                 "bamburi":"Bamburi Cement PLC",
                 "crown":"Crown Paints Kenya PLC",
+                "mapei":"Mapei East Africa Ltd",
             }
             label   = labels.get(fmt, fmt)
             chq_txt = f" · {chq_count} cheques" if chq_count else ""
