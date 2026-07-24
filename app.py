@@ -97,6 +97,7 @@ st.markdown("""
   <span class="badge">🟢 Bamburi Cement</span>
   <span class="badge">🔴 Crown Paints</span>
   <span class="badge">🔷 Mapei East Africa</span>
+  <span class="badge">🔵 Basco Paints</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
 """, unsafe_allow_html=True)
@@ -120,6 +121,7 @@ with st.expander("🎨 Supported formats"):
 | 🟢 **Bamburi Cement PLC** | Doc No · Delivery Note · Posting Date · Doc Type · Item Text/Ref · Qty · Unit · Amount · Running Balance |
 | 🔴 **Crown Paints Kenya PLC** | Date · Description (A/R Invoice/Credit Memo/Incoming Payment) · Doc No · Reference · Debit · Credit · Cumulative Bal. + Ageing Summary + Product Summary sheets |
 | 🔷 **Mapei East Africa Ltd** | Date · Invoice · Description · Due Date · Debit · Credit · Balance (credits shown as negatives; wrapped descriptions handled) |
+| 🔵 **Basco Products (K) Ltd** | Doc Date · Invoice No · Type (Invoice/Paymnt/Credit/Adjmnt) · Reference/Order No · Debit · Credit · Balance — multi-account merged statements + Ageing Summary sheet |
     """)
 
 # ── Colours & helpers ──────────────────────────────────────────────────────────
@@ -131,7 +133,7 @@ C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20
          skylife_teal="00838F", springtech_indigo="3F51B5", scania_red="C8102E",
          transsolutions_cyan="0097A7", autoxpress_amber="F57C00",
          gathani_maroon="7B1C1C", anco_teal="00695C", bamburi_green="00843D",
-         crown_red="C8102E", mapei_blue="005CA9")
+         crown_red="C8102E", mapei_blue="005CA9", basco_blue="0D47A1")
 MFMT = '#,##0.00;(#,##0.00);"-"'
 IFMT = '#,##0;(#,##0);"-"'
 
@@ -191,6 +193,7 @@ def detect(lines):
     t = "\n".join(lines[:50])
     tfull = "\n".join(lines[:150])
     if "MAPEI" in tfull.upper():                                       return "mapei"
+    if "BASCO" in tfull.upper():                                       return "basco"
     if "CROWN PAINTS" in tfull.upper():                                return "crown"
     if "SKYLIFE" in t.upper():                                        return "skylife"
     if "SPRINGTECH" in t.upper():                                      return "springtech"
@@ -2540,6 +2543,160 @@ def excel_coa(hdr, debits, credits, ageing):
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN CONVERT
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# BASCO PRODUCTS (K) LTD PARSER  (multi-account merged statements: NE29, NE35 …)
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_BSC  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+MONEY_BSC = re.compile(r"^[\d,]+\.\d{2}-?$")
+TYPES_BSC = {"Invoice", "Paymnt", "Adjmnt", "Credit", "Crnote", "Journal", "Dbnote"}
+
+def parse_basco(lines):
+    hdr = {"customer_name": "", "statement_date": "", "currency": "KES",
+           "terms": "", "accounts": [], "aging": []}
+    txs = []
+    acct = ""
+    seen_aging = set()
+    i = 0
+    while i < len(lines):
+        ln = lines[i].strip()
+
+        m = re.search(r"Customer #:\s*(\S+)", ln)
+        if m:
+            acct = m.group(1)
+            if acct not in hdr["accounts"]: hdr["accounts"].append(acct)
+        m = re.search(r"Customer Name:\s*(.+?)(?:\s+P\.O|\s+Bill To|$)", ln)
+        if m and not hdr["customer_name"]: hdr["customer_name"] = m.group(1).strip()
+        m = re.search(r"Statement Date:\s*(\d{2}/\d{2}/\d{4})", ln)
+        if m: hdr["statement_date"] = m.group(1)
+        m = re.search(r"Terms:\s*(.+?)(?:\s+Contact|$)", ln)
+        if m and not hdr["terms"]: hdr["terms"] = m.group(1).strip()
+
+        # ageing box (repeats on every page — keep one per account)
+        if "Current" in ln and "Amount Due" in ln:
+            for k in range(i + 1, min(i + 4, len(lines))):
+                nums = [t for t in lines[k].split() if MONEY_BSC.match(t)]
+                if len(nums) == 6:
+                    if acct not in seen_aging:
+                        seen_aging.add(acct)
+                        hdr["aging"].append({"acct": acct,
+                            "current": pnf(nums[0]), "d30": pnf(nums[1]),
+                            "d60": pnf(nums[2]), "d90": pnf(nums[3]),
+                            "d120": pnf(nums[4]), "due": pnf(nums[5])})
+                    i = k
+                    break
+            i += 1; continue
+
+        toks = ln.split()
+        if not toks or not DATE_BSC.match(toks[0]):
+            i += 1; continue
+
+        # peel trailing money tokens
+        ms = []
+        while len(toks) > 1 and MONEY_BSC.match(toks[-1]):
+            ms.insert(0, toks.pop())
+        date = toks[0]; rest = toks[1:]
+        inv = ""; typ = ""; ref = ""
+        if rest and rest[0] in TYPES_BSC:
+            typ = rest[0]; ref = " ".join(rest[1:])
+        elif len(rest) > 1 and rest[1] in TYPES_BSC:
+            inv = rest[0]; typ = rest[1]; ref = " ".join(rest[2:])
+        elif rest:
+            typ = rest[0]; ref = " ".join(rest[1:])
+        if not typ:
+            i += 1; continue
+
+        debit = credit = bal = None
+        if len(ms) >= 2 and not ms[-1].endswith("-"):
+            bal = pnf(ms[-1]); ms = ms[:-1]
+        for t in ms:
+            if t.endswith("-"): credit = pnf(t)   # stays negative
+            else:               debit  = pnf(t)
+
+        txs.append({"acct": acct, "date": date, "invoice": inv, "type": typ,
+                    "ref": ref, "debit": debit, "credit": credit, "balance": bal})
+        i += 1
+    return hdr, txs
+
+def excel_basco(hdr, txs):
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
+    ws.sheet_properties.tabColor = C["basco_blue"]
+    for i, w in enumerate([8, 12, 10, 9, 40, 16, 16, 16], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    banner(ws, 1, 8, "BASCO PRODUCTS (K) LTD  |  CUSTOMER STATEMENT", C["basco_blue"])
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [("Customer Name", hdr["customer_name"], "Statement Date", hdr["statement_date"]),
+            ("Account(s)", ", ".join(hdr["accounts"]), "Terms", hdr["terms"])]
+    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
+        for ci, val, bold in [(1, l1, True), (3, v1, False), (5, l2, True), (7, v2, False)]:
+            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci + 1)
+            c = ws.cell(row=r, column=ci, value=val)
+            c.font = lf if bold else vf; c.alignment = al
+            if bold: c.fill = lb
+        ws.row_dimensions[r].height = 16
+    H = 5
+    col_headers(ws, H, ["A/C", "Doc Date", "Invoice No", "Type",
+                        "Reference / Order No", "Debit (KES)", "Credit (KES)",
+                        "Balance (KES)"], C["basco_blue"])
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        cr = tx["type"] in ("Paymnt", "Credit")
+        bg = C["credit_row"] if cr else (C["alt_row"] if (ri - D) % 2 == 1 else None)
+        vals = [tx["acct"], tx["date"], tx["invoice"], tx["type"], tx["ref"],
+                tx["debit"], tx["credit"], tx["balance"]]
+        aligns = ["center", "center", "center", "center", "left", "right", "right", "right"]
+        fmts = [None, None, None, None, None, MFMT, MFMT, MFMT]
+        fgs = ["000000"] * 5 + [C["debit_fg"], C["credit_fg"], "000000"]
+        for ci, (v, a, f, fg) in enumerate(zip(vals, aligns, fmts, fgs), 1):
+            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"))
+        ws.row_dimensions[ri].height = 15
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:E{T}")
+    wc(ws, T, 1, "TOTAL  (Debit + Credit = net movement)", bold=True, fg=C["col_hdr_fg"],
+       bg=C["header_dark"], align="right", bdr=thin(), ind=1)
+    for ci, col, formula in [(6, "F", f"=SUM(F{D}:F{T-1})"),
+                             (7, "G", f"=SUM(G{D}:G{T-1})"),
+                             (8, "H", f"=F{T}+G{T}")]:
+        c = ws.cell(row=T, column=ci, value=formula)
+        c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+        c.fill = PatternFill("solid", start_color=C["header_dark"])
+        c.number_format = MFMT
+        c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    ws.row_dimensions[T].height = 18
+    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:H{T-1}"
+    ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True
+    ws.page_setup.fitToWidth = 1
+
+    # ── Ageing Summary sheet (one row per account) ──
+    if hdr["aging"]:
+        ag = wb.create_sheet("Ageing Summary")
+        ag.sheet_properties.tabColor = C["basco_blue"]
+        for i, w in enumerate([10, 18, 18, 18, 18, 18, 20], 1):
+            ag.column_dimensions[get_column_letter(i)].width = w
+        banner(ag, 1, 7, "BASCO PRODUCTS  |  AGEING SUMMARY", C["basco_blue"])
+        col_headers(ag, 3, ["A/C", "Current", "30 Days", "60 Days", "90 Days",
+                            "120 Days", "Amount Due"], C["basco_blue"])
+        r = 4
+        for a in hdr["aging"]:
+            vals = [a["acct"], a["current"], a["d30"], a["d60"], a["d90"], a["d120"], a["due"]]
+            for ci, v in enumerate(vals, 1):
+                wc(ag, r, ci, v, align="center" if ci == 1 else "right",
+                   fmt=None if ci == 1 else MFMT, bdr=thin("bottom"))
+            r += 1
+        wc(ag, r, 1, "TOTAL", bold=True, fg=C["col_hdr_fg"], bg=C["header_dark"],
+           align="right", bdr=thin(), ind=1)
+        for ci in range(2, 8):
+            L = get_column_letter(ci)
+            c = ag.cell(row=r, column=ci, value=f"=SUM({L}4:{L}{r-1})")
+            c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+            c.fill = PatternFill("solid", start_color=C["header_dark"])
+            c.number_format = MFMT
+            c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+
 def convert(pdf_bytes):
     lines=[]
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -2595,6 +2752,9 @@ def convert(pdf_bytes):
     elif fmt=="crown":
         hdr,txs,products=parse_crown(lines)
         return fmt,len(txs),0,pages,excel_crown(hdr,txs,products)
+    elif fmt=="basco":
+        hdr,txs=parse_basco(lines)
+        return fmt,len(txs),0,pages,excel_basco(hdr,txs)
     return "unknown",0,0,pages,None
 
 
