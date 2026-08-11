@@ -89,6 +89,7 @@ st.markdown("""
   <span class="badge">🔵 Basco Paints</span>
   <span class="badge">🐬 Dolphin Ricambi</span>
   <span class="badge">🦁 Simba Corp</span>
+  <span class="badge">🎨 Kansai Plascon</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
 """, unsafe_allow_html=True)
@@ -114,6 +115,7 @@ with st.expander("🎨 Supported formats"):
 | 🔵 **Basco Products (K) Ltd** | Doc Date · Invoice No · Type (Invoice/Paymnt/Credit/Adjmnt) · Reference/Order No · Debit · Credit · Balance — multi-account merged statements + Ageing Summary sheet |
 | 🐬 **Dolphin Ricambi Ltd** | Tally-style ledger: Date · Particulars · Vch Type · Vch No · Excise Inv No · Narration · Debit · Credit · Running Balance |
 | 🦁 **Simba Corporation Ltd** | Posting Date · Reference/LPO · Veh Reg · Document No · CU Invoice No · Description · Due Date · Original Amt · Remaining Amt · Balance + Aged Summary sheet |
+| 🎨 **Kansai Plascon Kenya Ltd** | Doc Type (IN/JE/RC) · Document No · BP Ref. No. · Post. Date · Due Date · Details · Amount · Balance (wrapped BP refs handled) + Ageing Summary sheet |
     """)
 # ── Colours & helpers ──────────────────────────────────────────────────────────
 C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20",
@@ -125,7 +127,7 @@ C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20
          transsolutions_cyan="0097A7", autoxpress_amber="F57C00",
          gathani_maroon="7B1C1C", anco_teal="00695C", bamburi_green="00843D",
          crown_red="C8102E", mapei_blue="005CA9", basco_blue="0D47A1",
-         dolphin_navy="0D3B66", simba_red="B71C1C")
+         dolphin_navy="0D3B66", simba_red="B71C1C", plascon_red="D0112B")
 MFMT = '#,##0.00;(#,##0.00);"-"'
 IFMT = '#,##0;(#,##0);"-"'
 def pnf(s):
@@ -169,6 +171,7 @@ def col_headers(ws, row, headers, bg):
 def detect(lines):
     t = "\n".join(lines[:50])
     tfull = "\n".join(lines[:150])
+    if "KANSAI PLASCON" in tfull.upper() or "PLASCON" in t.upper():   return "plascon"
     if "DOLPHIN RICAMBI" in tfull.upper() or "DOLPHIN" in t.upper():     return "dolphin"
     if "SIMBA CORP" in tfull.upper():                                     return "simba"
     if "MAPEI" in tfull.upper():                                       return "mapei"
@@ -2605,6 +2608,154 @@ def excel_basco(hdr, txs):
             c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
 # ══════════════════════════════════════════════════════════════════════════════
+# KANSAI PLASCON KENYA LIMITED PARSER  (SAP Business One customer statement)
+# Row layout: Doc Type (IN/JE/RC) · Document No · BP Ref. No. · Post. Date ·
+#   Due Date · Details · Amount · Balance — long BP references wrap onto the
+#   following line(s) as short fragments; JE/RC rows are credits (negative
+#   amounts) with no BP reference. Ends with "Total KES x" + ageing buckets row.
+# ══════════════════════════════════════════════════════════════════════════════
+DATE_KP  = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+MONEY_KP = re.compile(r"^-?[\d,]+\.\d{2}$")
+DOC_KP   = ("IN", "JE", "RC", "CN", "DN", "CM", "DP")
+SKIP_KP  = ("KANSAI PLASCON", "KENYA LIMITED", "Posting Date", "Aged By", "Customer Group",
+            "BP: From", "Currency:", "Prior Period Balance",
+            "Document BP Ref", "Phone #", "Fax #", "Address:", "Connected BP",
+            "Page:", "Printed By", "Balance Due Future Remit", "Ageing (%)",
+            "NEW MUTHOKINJU HARDWARE LTD")
+def parse_plascon(lines):
+    hdr = {"supplier": "Kansai Plascon Kenya Limited", "customer": "", "bp_code": "",
+           "statement_date": "", "ageing_date": "", "aged_by": "", "sales_employee": "",
+           "address": "", "currency": "KES", "closing_balance": None, "buckets": {}}
+    for ln in lines[:15]:
+        m = re.search(r"To\s+(\d{2}\.\d{2}\.\d{4})\s+Ageing Date:\s*(\d{2}\.\d{2}\.\d{4})", ln)
+        if m: hdr["statement_date"] = m.group(1); hdr["ageing_date"] = m.group(2)
+        m = re.search(r"Aged By:\s*(.+)", ln)
+        if m: hdr["aged_by"] = m.group(1).strip()
+        m = re.search(r"BP:\s*From\s+(\S+)", ln)
+        if m: hdr["bp_code"] = m.group(1)
+        m = re.search(r"^(\S+)\s+(NEW MUTHOKINJU.*)$", ln)
+        if m and "NE" in m.group(1): hdr["customer"] = m.group(2).strip()
+        m = re.search(r"Sales Employee:\s*(.+)", ln)
+        if m: hdr["sales_employee"] = m.group(1).strip()
+        m = re.search(r"Address:\s*(.+)", ln)
+        if m: hdr["address"] = m.group(1).strip()
+    txs = []
+    for ln in lines:
+        s = ln.strip()
+        if not s: continue
+        if s.startswith("Total KES"):
+            m = re.search(r"([\d,]+\.\d{2})", s)
+            if m: hdr["closing_balance"] = pnf(m.group(1))
+            continue
+        if s.startswith("Total ") and not s.startswith("Total KES"):
+            nums = re.findall(r"-?[\d,]+\.\d{2}", s)
+            keys = ["balance_due", "future_remit", "d0_30", "d31_60", "d61_90", "d91_120", "d121_plus"]
+            for ki, n in enumerate(nums):
+                if ki < len(keys): hdr["buckets"][keys[ki]] = pnf(n)
+            continue
+        if any(k in s for k in SKIP_KP): continue
+        parts = s.split()
+        # transaction row: DOCTYPE DOCNO [BP REF …] POST.DATE DUE.DATE DETAILS AMOUNT [BALANCE]
+        if len(parts) >= 2 and parts[0] in DOC_KP and re.match(r"^\d{6,}$", parts[1]):
+            date_idx = [j for j, p in enumerate(parts) if DATE_KP.match(p)]
+            if len(date_idx) < 2: continue
+            p_idx, d_idx = date_idx[0], date_idx[1]
+            post_date, due_date = parts[p_idx], parts[d_idx]
+            bp_ref = " ".join(parts[2:p_idx])
+            tail = parts[d_idx+1:]
+            money_idx = [j for j, p in enumerate(tail) if MONEY_KP.match(p)]
+            amount = balance = None
+            if len(money_idx) >= 2:
+                amount = pnf(tail[money_idx[-2]]); balance = pnf(tail[money_idx[-1]])
+                details = " ".join(tail[:money_idx[-2]])
+            elif len(money_idx) == 1:
+                amount = pnf(tail[money_idx[0]])
+                details = " ".join(tail[:money_idx[0]])
+            else:
+                details = " ".join(tail)
+            txs.append({"doc_type": parts[0], "doc_no": parts[1], "bp_ref": bp_ref,
+                        "post_date": post_date, "due_date": due_date, "details": details,
+                        "amount": amount, "balance": balance})
+        else:
+            # continuation fragment of a wrapped BP reference
+            if txs and not any(MONEY_KP.match(p) for p in parts) and len(s) <= 30:
+                txs[-1]["bp_ref"] = (txs[-1]["bp_ref"] + " " + s).strip()
+    return hdr, txs
+def excel_plascon(hdr, txs):
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
+    ws.sheet_properties.tabColor = C["plascon_red"]
+    for i, w in enumerate([9, 13, 34, 12, 12, 22, 16, 18], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    banner(ws, 1, 8, "KANSAI PLASCON KENYA LIMITED  |  CUSTOMER STATEMENT", C["plascon_red"])
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [("Customer", hdr.get("customer", ""), "BP Code", hdr.get("bp_code", "")),
+            ("Statement Date", hdr.get("statement_date", ""), "Ageing Date", hdr.get("ageing_date", "")),
+            ("Aged By", hdr.get("aged_by", ""), "Sales Employee", hdr.get("sales_employee", "")),
+            ("Address", hdr.get("address", ""), "Currency", hdr.get("currency", "KES"))]
+    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
+        for ci, lbl, val in [(1, l1, v1), (5, l2, v2)]:
+            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci + 1)
+            ws.merge_cells(start_row=r, start_column=ci + 2, end_row=r, end_column=ci + 2)
+            lc = ws.cell(row=r, column=ci, value=lbl); lc.font = lf; lc.fill = lb; lc.alignment = al
+            vc = ws.cell(row=r, column=ci + 2, value=val); vc.font = vf; vc.alignment = al
+        ws.row_dimensions[r].height = 16
+    H = 7
+    col_headers(ws, H, ["Doc Type", "Document No", "BP Ref. No.", "Post. Date", "Due Date",
+                        "Details", "Amount (KES)", "Balance (KES)"], C["plascon_red"])
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_cr = (tx["amount"] or 0) < 0
+        bg = C["credit_row"] if is_cr else (C["alt_row"] if (ri - D) % 2 == 1 else None)
+        vals = [tx["doc_type"], tx["doc_no"], tx["bp_ref"], tx["post_date"], tx["due_date"],
+                tx["details"], tx["amount"], tx["balance"]]
+        aligns = ["center", "center", "left", "center", "center", "left", "right", "right"]
+        fmts = [None, None, None, None, None, None, MFMT, MFMT]
+        for ci, (v, a, f) in enumerate(zip(vals, aligns, fmts), 1):
+            fg = "000000"
+            if ci == 7 and v is not None: fg = C["credit_fg"] if v < 0 else C["debit_fg"]
+            if ci == 8 and v is not None: fg = C["neg_bal"] if v < 0 else "000000"
+            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"), sz=9 if ci != 3 else 8)
+        ws.row_dimensions[ri].height = 15
+    T = D + len(txs)
+    ws.merge_cells(f"A{T}:F{T}")
+    wc(ws, T, 1, "TOTAL / CLOSING BALANCE", bold=True, fg=C["col_hdr_fg"], bg=C["plascon_red"],
+       align="right", bdr=thin(), ind=1)
+    c = ws.cell(row=T, column=7, value=f"=SUM(G{D}:G{T-1})")
+    c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+    c.fill = PatternFill("solid", start_color=C["plascon_red"])
+    c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    closing = hdr.get("closing_balance")
+    if closing is None and txs: closing = txs[-1]["balance"]
+    c = ws.cell(row=T, column=8, value=closing)
+    c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+    c.fill = PatternFill("solid", start_color=C["plascon_red"])
+    c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    ws.row_dimensions[T].height = 18
+    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:H{T-1}"
+    ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
+    b = hdr.get("buckets") or {}
+    if any(v is not None for v in b.values()):
+        ws2 = wb.create_sheet("Ageing Summary"); ws2.sheet_properties.tabColor = C["plascon_red"]
+        for col, w in [("A", 24), ("B", 18)]: ws2.column_dimensions[col].width = w
+        ws2.merge_cells("A1:B1")
+        wc(ws2, 1, 1, "AGEING SUMMARY (by Due Date)", bold=True, fg=C["col_hdr_fg"],
+           bg=C["plascon_red"], align="center", sz=12)
+        ws2.row_dimensions[1].height = 26
+        rows2 = [("Future Remit", b.get("future_remit")), ("0 - 30 Days", b.get("d0_30")),
+                 ("31 - 60 Days", b.get("d31_60")), ("61 - 90 Days", b.get("d61_90")),
+                 ("91 - 120 Days", b.get("d91_120")), ("121+ Days", b.get("d121_plus")),
+                 ("Balance Due", b.get("balance_due"))]
+        for ri, (lbl, val) in enumerate(rows2, start=2):
+            bold = lbl == "Balance Due"
+            bg2 = C["info_bg"] if bold else None
+            wc(ws2, ri, 1, lbl, bold=bold, align="left", bdr=thin("bottom"), bg=bg2)
+            wc(ws2, ri, 2, val, align="right", fmt=MFMT, bdr=thin("bottom"),
+               fg=C["neg_bal"] if (val or 0) < 0 else "000000", bg=bg2)
+            ws2.row_dimensions[ri].height = 16
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN CONVERT
 # ══════════════════════════════════════════════════════════════════════════════
 def convert(pdf_bytes):
@@ -2615,7 +2766,10 @@ def convert(pdf_bytes):
             t=page.extract_text()
             if t: lines.extend(t.split("\n"))
     fmt=detect(lines)
-    if fmt=="dolphin":
+    if fmt=="plascon":
+        hdr,txs=parse_plascon(lines)
+        return fmt,len(txs),0,pages,excel_plascon(hdr,txs)
+    elif fmt=="dolphin":
         hdr,txs=parse_dolphin(lines)
         return fmt,len(txs),0,pages,excel_dolphin(hdr,txs)
     elif fmt=="simba":
@@ -3144,6 +3298,7 @@ if uploaded:
                 "basco":"Basco Products (K) Ltd",
                 "dolphin":"Dolphin Ricambi Ltd",
                 "simba":"Simba Corporation Ltd",
+                "plascon":"Kansai Plascon Kenya Ltd",
             }
             label   = labels.get(fmt, fmt)
             chq_txt = f" · {chq_count} cheques" if chq_count else ""
