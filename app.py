@@ -7,124 +7,97 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from pathlib import Path
 
-st.set_page_config(page_title="Statement PDF → Excel", page_icon="📄", layout="centered")
+st.set_page_config(page_title="Statement → Excel", page_icon="📄", layout="centered")
+
+SUPPLIERS = [
+    ("Savannah Cement", "Doc No · Ref/Vehicle · Date · Due Date · Details · Debit · Credit · Balance"),
+    ("National Cement", "Date · Description · Vehicle · LPO · Qty · Invoice · CU Invoice · Debit · Credit · Balance + Cheques"),
+    ("Mombasa Cement", "Doc Date · Reference · Cheque No · Description · Amount · Balance"),
+    ("Karsan Ramji (Ndovu)", "Date · Doc No · BP Ref · CU Invoice · Line Memo · Debit · Credit · Balance"),
+    ("Skylife Kenya", "Tally ledger: Date · Particulars · Vch No · Debit · Credit · Balance"),
+    ("Springtech (K) Ltd", "Date · Transaction · Amount · Balance + Ageing"),
+    ("Scania East Africa", "Date · Invoice · Description · Due Date · Debit · Credit · Balance"),
+    ("Trans-Solutions (E.A)", "Date · Transaction · Amount · Balance + Ageing"),
+    ("AutoXpress", "Date · Tax Invoice · LPO · Invoice · Payment · Cumulative + Ageing"),
+    ("Gathani Limited", "Date · Particulars · Doc Ref · Debit · Credit · Nett + Ageing"),
+    ("Anco Trading Ltd", "Transaction · Doc No · Ref · Date · Debit · Credit · Balance + Ageing"),
+    ("Doshi / Ultra (COA)", "Debit and credit columns side by side + Ageing"),
+    ("Bamburi Cement PLC", "Doc No · Delivery Note · Date · Type · Ref · Qty · Amount · Balance"),
+    ("Crown Paints Kenya PLC", "Date · Description · Doc No · Debit · Credit · Balance + Ageing + Products"),
+    ("Mapei East Africa Ltd", "Date · Invoice · Description · Due Date · Debit · Credit · Balance"),
+    ("Basco Products (K) Ltd", "Date · Invoice · Type · Reference · Debit · Credit · Balance + Ageing"),
+    ("Dolphin Ricambi Ltd", "Tally ledger: Date · Particulars · Vch Type/No · Narration · Debit · Credit"),
+    ("Simba Corporation Ltd", "Date · LPO · Veh Reg · Doc No · CU Invoice · Amounts · Balance + Ageing"),
+    ("Kansai Plascon Kenya Ltd", "Doc Type · Doc No · BP Ref · Dates · Details · Amount · Balance + Ageing"),
+    ("Printan Limited", "Date · Transaction · Doc No · Due Date · Amount · Payments · Balance + Allocations"),
+]
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700;800&display=swap');
-html, body, [class*="css"] { font-family:'Poppins',sans-serif; }
-.stApp { background: linear-gradient(160deg,#fdf2ff 0%,#eef4ff 45%,#fff8ec 100%); }
-.hero{
-  background: linear-gradient(120deg,#ff5f6d 0%,#a06be0 35%,#3b82f6 70%,#06b6d4 100%);
-  background-size: 200% 200%;
-  animation: gradientshift 8s ease infinite;
-  border-radius: 24px;
-  padding: 42px 32px 34px;
-  margin-bottom: 26px;
-  color: white;
-  text-align: center;
-  box-shadow: 0 18px 40px -12px rgba(124,58,237,.45);
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+:root{
+  --ink:#14213D; --muted:#5B6474; --line:#E3E6EC; --card:#FFFFFF;
+  --bg:#F5F6F8; --accent:#2F5BEA; --accent-soft:#EAF0FE; --ok:#1E7A4F; --ok-soft:#E8F5EE;
 }
-@keyframes gradientshift{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
-.hero h1{font-size:2.3rem;margin:0 0 10px;font-weight:800;letter-spacing:-.5px;
-  text-shadow:0 2px 12px rgba(0,0,0,.15)}
-.hero p{font-size:1.05rem;opacity:.95;margin:0 0 4px;font-weight:400}
-.badge{display:inline-block;background:rgba(255,255,255,.22);backdrop-filter:blur(6px);
-       border:1px solid rgba(255,255,255,.35);border-radius:24px;
-       padding:5px 16px;font-size:.82rem;font-weight:600;margin:10px 5px 0}
-.ok{
-  background: linear-gradient(120deg,#d1fae5,#ecfeff);
-  border: 1.5px solid #34d399;
-  border-radius: 16px;
-  padding: 18px 22px;
-  color:#065f46;
-  font-weight:600;
-  margin-top:14px;
-  box-shadow: 0 6px 18px -8px rgba(16,185,129,.35);
-}
-div[data-testid="stExpander"]{
-  border-radius:16px!important; border:1.5px solid #e9d5ff!important;
-  background:white!important; box-shadow:0 4px 14px -8px rgba(124,58,237,.25)!important;
-}
+html, body, .stApp, [class*="css"]{font-family:'Inter',system-ui,sans-serif;}
+.stApp{background:var(--bg);}
+.stApp, .stApp p, .stApp li, .stApp label, .stApp span, .stMarkdown, .stCaption{color:var(--ink);}
+.block-container{padding-top:2.5rem;max-width:760px;}
+
+.app-head{display:flex;align-items:center;gap:14px;margin-bottom:6px}
+.app-logo{width:44px;height:44px;border-radius:12px;background:var(--accent);
+  color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:20px}
+.app-head h1{font-size:1.6rem;font-weight:700;margin:0;color:var(--ink);letter-spacing:-.3px}
+.app-sub{color:var(--muted);font-size:.95rem;margin:0 0 22px}
+
+.step{font-size:.78rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--muted);margin:18px 0 6px}
+
+div[role="radiogroup"]{gap:8px}
+div[role="radiogroup"] label{background:var(--card);border:1px solid var(--line);
+  border-radius:10px;padding:8px 14px;margin:0!important}
+div[role="radiogroup"] label:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
+
 section[data-testid="stFileUploaderDropzone"]{
-  border-radius:18px!important; border:2px dashed #a855f7!important;
-  background: linear-gradient(135deg,#fdf4ff,#eef2ff)!important;
-}
-.stDownloadButton>button{
-  background: linear-gradient(120deg,#f97316,#ec4899,#8b5cf6)!important;
-  background-size:200% 100%!important;
-  color:white!important; border-radius:14px!important;
-  padding:13px 24px!important; font-size:1.05rem!important;
-  font-weight:700!important; width:100%!important; border:none!important;
-  box-shadow:0 10px 24px -8px rgba(236,72,153,.55)!important;
-  transition:all .25s ease!important;
-}
-.stDownloadButton>button:hover{
-  background-position:100% 0!important; transform:translateY(-2px)!important;
-  box-shadow:0 14px 30px -8px rgba(236,72,153,.7)!important;
-}
-.footer-note{
-  text-align:center; color:#9333ea; font-size:.85rem; font-weight:600;
-  background:linear-gradient(90deg,#fdf4ff,#eef2ff); border-radius:12px;
-  padding:12px; margin-top:8px;
-}
+  background:var(--card)!important;border:1.5px dashed #B9C2D3!important;border-radius:12px!important}
+section[data-testid="stFileUploaderDropzone"]:hover{border-color:var(--accent)!important}
+
+div[data-testid="stExpander"]{background:var(--card)!important;border:1px solid var(--line)!important;
+  border-radius:12px!important;box-shadow:none!important}
+div[data-testid="stExpander"] summary, div[data-testid="stExpander"] summary *{color:var(--ink)!important}
+
+.note{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--accent);
+  border-radius:10px;padding:12px 16px;color:var(--ink);font-size:.9rem;margin:8px 0}
+.note b{color:var(--ink)}
+.result{background:var(--ok-soft);border:1px solid #BFE3CF;border-radius:12px;
+  padding:14px 18px;color:var(--ok);font-weight:600;margin:12px 0 4px}
+.file-chip{display:inline-block;background:var(--card);border:1px solid var(--line);
+  border-radius:8px;padding:6px 12px;font-size:.88rem;color:var(--ink);margin:6px 0}
+
+div[data-testid="stMetric"]{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px}
+div[data-testid="stMetricLabel"] *{color:var(--muted)!important}
+div[data-testid="stMetricValue"]{color:var(--ink)!important;font-size:1.4rem!important}
+
+.stDownloadButton>button{background:var(--accent)!important;color:#fff!important;border:none!important;
+  border-radius:10px!important;padding:12px 20px!important;font-weight:600!important;width:100%!important}
+.stDownloadButton>button:hover{background:#2348C4!important}
+.stDownloadButton>button *{color:#fff!important}
+
+section[data-testid="stSidebar"]{background:var(--card);border-right:1px solid var(--line)}
+.key-status{border-radius:10px;padding:10px 12px;font-size:.85rem;margin:6px 0 10px;border:1px solid}
+.key-ok{background:var(--ok-soft);border-color:#BFE3CF;color:var(--ok)}
+.key-warn{background:#FFF6E5;border-color:#F3D9A4;color:#8A5A00}
+
+.foot{color:var(--muted);font-size:.8rem;text-align:center;margin-top:28px}
+footer, #MainMenu{visibility:hidden}
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("""
-<div class="hero">
-  <h1>📄✨ Statement → Excel</h1>
-  <p>Upload a customer statement PDF and get a beautifully formatted Excel file in seconds.</p>
-  <span class="badge">🟠 Savannah Cement</span>
-  <span class="badge">🔵 National Cement</span>
-  <span class="badge">🟢 Mombasa Cement</span>
-  <span class="badge">🟣 Karsan Ramji</span>
-  <span class="badge">🟦 Skylife</span>
-  <span class="badge">🟪 Springtech</span>
-  <span class="badge">🔴 Scania</span>
-  <span class="badge">🟩 Trans-Solutions</span>
-  <span class="badge">🟧 AutoXpress</span>
-  <span class="badge">🟥 Gathani</span>
-  <span class="badge">🩵 Anco Trading</span>
-  <span class="badge">🟤 Doshi / Ultra (COA)</span>
-  <span class="badge">🟢 Bamburi Cement</span>
-  <span class="badge">🔴 Crown Paints</span>
-  <span class="badge">🔷 Mapei East Africa</span>
-  <span class="badge">🔵 Basco Paints</span>
-  <span class="badge">🐬 Dolphin Ricambi</span>
-  <span class="badge">🦁 Simba Corp</span>
-  <span class="badge">🎨 Kansai Plascon</span>
-  <span class="badge">🖨️ Printan</span>
-  <span class="badge">🔒 Files never stored</span>
-</div>
+st.markdown(f"""
+<div class="app-head"><div class="app-logo">⇄</div><h1>Statement → Excel</h1></div>
+<p class="app-sub">Convert supplier statement PDFs into formatted Excel workbooks.
+{len(SUPPLIERS)} supplier layouts built in; AI mode reads any other.</p>
 """, unsafe_allow_html=True)
-
-with st.expander("🎨 Supported formats"):
-    st.markdown("""
-| Supplier | Key Columns |
-|---|---|
-| 🟠 **Savannah Cement** | Doc No · Ref/Vehicle · Date · Due Date · Details · Debit · Credit · Balance |
-| 🔵 **National Cement** | Date · Description · Vehicle · LPO · Qty · Invoice · CU Invoice · Location · Debit · Credit · Balance + Cheques sheet |
-| 🟢 **Mombasa Cement** | Doc Date · Reference · Cheque No · Description · Amount · Balance |
-| 🟣 **Karsan Ramji (Ndovu)** | Date · Doc No · BP Ref · CU Invoice · Line Memo · Debit · Credit · Balance |
-| 🟦 **Skylife Kenya** | Tally-style ledger: Date · Particulars · Vch No · Debit · Credit · Running Balance |
-| 🟪 **Springtech (K) Ltd** | Date · Transaction · Amount · Balance + Ageing Summary sheet |
-| 🔴 **Scania East Africa** | Date · Invoice · Description · Due Date · Debit · Credit · Balance |
-| 🟩 **Trans-Solutions (E.A)** | Date · Transaction · Amount · Balance + Ageing Summary sheet |
-| 🟧 **AutoXpress** | Date · Tax Invoice · GP Invoice · LPO · Opening Bal · Invoice · Payment · Cummulative + Ageing Summary sheet |
-| 🟥 **Gathani Limited** | Date · Particulars · Doc Ref · Debit · Credit · Nett Amount + Ageing Summary sheet |
-| 🩵 **Anco Trading Ltd** | Transaction · Doc No · Ref No · Doc Date · DR/CR · Debit · Credit · Balance + Ageing Analysis sheet |
-| 🟤 **Doshi / Ultra (COA)** | Two-column layout: Debit (Date · Particulars · CU Invoice · Amount) + Credit (Date · Particulars · Amount) + Ageing Summary |
-| 🟢 **Bamburi Cement PLC** | Doc No · Delivery Note · Posting Date · Doc Type · Item Text/Ref · Qty · Unit · Amount · Running Balance |
-| 🔴 **Crown Paints Kenya PLC** | Date · Description (A/R Invoice/Credit Memo/Incoming Payment) · Doc No · Reference · Debit · Credit · Cumulative Bal. + Ageing Summary + Product Summary sheets |
-| 🔷 **Mapei East Africa Ltd** | Date · Invoice · Description · Due Date · Debit · Credit · Balance (credits shown as negatives; wrapped descriptions handled) |
-| 🔵 **Basco Products (K) Ltd** | Doc Date · Invoice No · Type (Invoice/Paymnt/Credit/Adjmnt) · Reference/Order No · Debit · Credit · Balance — multi-account merged statements + Ageing Summary sheet |
-| 🐬 **Dolphin Ricambi Ltd** | Tally-style ledger: Date · Particulars · Vch Type · Vch No · Excise Inv No · Narration · Debit · Credit · Running Balance |
-| 🦁 **Simba Corporation Ltd** | Posting Date · Reference/LPO · Veh Reg · Document No · CU Invoice No · Description · Due Date · Original Amt · Remaining Amt · Balance + Aged Summary sheet |
-| 🎨 **Kansai Plascon Kenya Ltd** | Doc Type (IN/JE/RC) · Document No · BP Ref. No. · Post. Date · Due Date · Details · Amount · Balance (wrapped BP refs handled) + Ageing Summary sheet |
-| 🖨️ **Printan Limited** | Date · Transaction · Document No · Due Date · Amount · Payments · Balance + Payment Allocation sheet + summary check against the PDF |
-| 🤖 **Any other supplier** | AI Mode — Claude reads the statement in page chunks and checks every running balance |
-    """)
 
 # ── Colours & helpers ──────────────────────────────────────────────────────────
 C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20",
@@ -3372,229 +3345,124 @@ def convert_ai(pdf_bytes, filename, api_key):
 # ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
-st.markdown("""
-<style>
-.ai-banner{
-  background:linear-gradient(120deg,#6a1b9a,#4a148c,#1a237e);
-  background-size:200% 200%;animation:gradientshift 6s ease infinite;
-  border-radius:18px;padding:20px 24px;color:white;margin:14px 0;
-  box-shadow:0 10px 28px -8px rgba(106,27,154,.55);
+LABELS = {
+    "savannah":"Savannah Cement","national":"National Cement","mombasa":"Mombasa Cement",
+    "karsan":"Karsan Ramji (Ndovu)","skylife":"Skylife Kenya","springtech":"Springtech (K) Ltd",
+    "scania":"Scania East Africa","transsolutions":"Trans-Solutions (E.A)",
+    "autoxpress":"AutoXpress Limited","gathani":"Gathani Limited","anco":"Anco Trading Ltd",
+    "coa":"Confirmation of Accounts","bamburi":"Bamburi Cement PLC","crown":"Crown Paints Kenya PLC",
+    "mapei":"Mapei East Africa Ltd","basco":"Basco Products (K) Ltd","dolphin":"Dolphin Ricambi Ltd",
+    "simba":"Simba Corporation Ltd","plascon":"Kansai Plascon Kenya Ltd","printan":"Printan Limited",
 }
-.ai-banner h3{margin:0 0 6px;font-size:1.2rem;font-weight:800}
-.ai-banner p{margin:0;font-size:.9rem;opacity:.9}
-.ai-ok{
-  background:linear-gradient(120deg,#ede7f6,#e8eaf6);
-  border:1.5px solid #9c27b0;border-radius:16px;
-  padding:18px 22px;color:#4a148c;font-weight:600;
-  margin-top:14px;box-shadow:0 6px 18px -8px rgba(156,39,176,.3);
-}
-.key-box{
-  background:#fafafa;border:1.5px solid #e0e0e0;border-radius:12px;
-  padding:14px 16px;margin:10px 0;font-size:.85rem;color:#444;
-}
-.key-ok  {border-color:#43a047;background:#f1f8e9;color:#2e7d32}
-.key-warn{border-color:#fb8c00;background:#fff8e1;color:#e65100}
-</style>
-""", unsafe_allow_html=True)
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
+# ── Sidebar: API key ──────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚙️ Settings")
-    st.markdown("---")
-    st.markdown("### 🤖 AI Mode — API Key")
-    st.markdown(
-        "AI Mode uses the **Claude API**. "
-        "The key is resolved in this order:\n"
-        "1. Streamlit Cloud **Secrets** (`ANTHROPIC_API_KEY`)\n"
-        "2. Environment variable `ANTHROPIC_API_KEY`\n"
-        "3. Entered below (session only — not stored)"
-    )
+    st.markdown("### AI mode settings")
     _auto_key = ""
     try:
-        _auto_key = st.secrets.get("ANTHROPIC_API_KEY","") or ""
+        _auto_key = st.secrets.get("ANTHROPIC_API_KEY", "") or ""
     except Exception:
         pass
     if not _auto_key:
-        _auto_key = os.environ.get("ANTHROPIC_API_KEY","")
+        _auto_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if _auto_key:
-        masked = _auto_key[:8] + "••••••••" + _auto_key[-4:]
-        st.markdown(f'<div class="key-box key-ok">✅ API key loaded automatically<br><code>{masked}</code></div>',
+        st.markdown(f'<div class="key-status key-ok">API key loaded · <code>{_auto_key[:7]}…{_auto_key[-4:]}</code></div>',
                     unsafe_allow_html=True)
     else:
-        st.markdown('<div class="key-box key-warn">⚠️ No key found in secrets/env — enter below for this session</div>',
+        st.markdown('<div class="key-status key-warn">No saved key. Paste one below for this session.</div>',
                     unsafe_allow_html=True)
-        manual_key = st.text_input(
-            "Anthropic API Key",
-            type="password",
-            placeholder="sk-ant-api03-...",
-            help="Get your key at console.anthropic.com — it is used only for this session and never stored.",
-            key="manual_api_key_input",
-        )
+        manual_key = st.text_input("Anthropic API key", type="password",
+                                   placeholder="sk-ant-api03-…", key="manual_api_key_input",
+                                   help="Used only for this session; never stored.")
         if manual_key:
             st.session_state["_anthropic_key"] = manual_key
-            st.success("Key saved for this session ✅")
-    st.caption(f"Model: `{AI_MODEL}` · {PAGES_PER_CHUNK} pages per request")
-    st.markdown("---")
-    st.markdown("### 📖 How to add a permanent key")
-    with st.expander("Streamlit Cloud (recommended)"):
+    st.caption(f"Model `{AI_MODEL}` · {PAGES_PER_CHUNK} pages per request")
+    with st.expander("Save the key permanently"):
         st.markdown('''
-1. Open your app in Streamlit Cloud
-2. Go to **Settings → Secrets**
-3. Add:
+**Streamlit Cloud:** Settings → Secrets, add
 ```toml
 ANTHROPIC_API_KEY = "sk-ant-api03-..."
 ```
-4. Save — your app will restart with the key available
-        ''')
-    with st.expander("Local / Anaconda"):
-        st.markdown('''
-Set the environment variable before running:
-```bash
-# Windows (Anaconda Prompt)
-set ANTHROPIC_API_KEY=sk-ant-api03-...
-streamlit run app.py
-# Mac / Linux
-export ANTHROPIC_API_KEY=sk-ant-api03-...
-streamlit run app.py
-```
-Or create `.streamlit/secrets.toml` next to `app.py` (add it to `.gitignore`).
-        ''')
-    with st.expander("Get an API key"):
-        st.markdown('''
-1. Go to **console.anthropic.com**
-2. Sign in / create an account
-3. Navigate to **API Keys**
-4. Click **Create Key** — copy and save it securely
-5. Add credit under **Billing** (API usage is billed separately)
-        ''')
-    st.markdown("---")
-    st.caption("Statement PDF → Excel · Files never stored")
+**Local:** put the same line in `.streamlit/secrets.toml`
+(and add that file to `.gitignore`).
 
-mode = st.radio(
-    "Conversion mode:",
-    ["🔵  Rule-Based  (fast · free · known suppliers)",
-     "🤖  AI Mode  (any supplier · requires API key)"],
-    horizontal=True,
-)
-use_ai = mode.startswith("🤖")
+**New key:** console.anthropic.com → API Keys. Add credit under Billing.
+        ''')
+
+# ── Step 1: mode ──────────────────────────────────────────────────────────────
+st.markdown('<div class="step">1 · Conversion mode</div>', unsafe_allow_html=True)
+mode = st.radio("Conversion mode", ["Standard (built-in suppliers)", "AI (any supplier)"],
+                horizontal=True, label_visibility="collapsed")
+use_ai = mode.startswith("AI")
 
 if use_ai:
-    api_key = _get_api_key()
-    if not api_key:
-        st.markdown("""
-<div class="ai-banner">
-  <h3>🔑 API Key Required</h3>
-  <p>AI Mode needs an Anthropic API key. Enter it in the <b>sidebar → AI Mode — API Key</b>,
-  or add it to Streamlit Secrets / your environment variable.<br>
-  Get one at <b>console.anthropic.com</b></p>
-</div>""", unsafe_allow_html=True)
+    if _get_api_key():
+        st.markdown('<div class="note">Claude reads the statement page by page and checks every running balance. '
+                    'The PDF is sent to the Claude API, so avoid confidential documents.</div>',
+                    unsafe_allow_html=True)
     else:
-        st.markdown("""
-<div class="ai-banner">
-  <h3>🤖 AI Universal Parser — powered by Claude</h3>
-  <p>Upload <b>any</b> supplier statement PDF. Claude reads it page by page, extracts every
-  transaction into a formatted Excel and checks each running balance — no template required.</p>
-  <p style="margin-top:8px;font-size:.8rem;opacity:.75">
-  ⚠️ The statement is sent to the Claude API &nbsp;·&nbsp;
-  Do not upload confidential documents &nbsp;·&nbsp;
-  Always verify totals against the original PDF</p>
-</div>""", unsafe_allow_html=True)
-else:
-    api_key = None
+        st.markdown('<div class="note"><b>API key needed.</b> Add your Anthropic key in the sidebar to use AI mode.</div>',
+                    unsafe_allow_html=True)
 
-uploaded = st.file_uploader(
-    "Drop your PDF here",
-    type=["pdf","PDF"],
-    label_visibility="collapsed",
-    key="pdf_upload",
-)
+# ── Step 2: upload ────────────────────────────────────────────────────────────
+st.markdown('<div class="step">2 · Upload statement</div>', unsafe_allow_html=True)
+uploaded = st.file_uploader("PDF statement", type=["pdf", "PDF"],
+                            label_visibility="collapsed", key="pdf_upload")
 
+# ── Step 3: result ────────────────────────────────────────────────────────────
 if uploaded:
-    st.markdown(f"📎 **Uploaded:** `{uploaded.name}` &nbsp;({uploaded.size/1024:.1f} KB)")
     pdf_bytes = uploaded.read()
+    st.markdown('<div class="step">3 · Download</div>', unsafe_allow_html=True)
+
     if use_ai:
         api_key = _get_api_key()
         if not api_key:
-            st.error("❌ No API key found. Enter your Anthropic API key in the sidebar first.")
+            st.error("Add your Anthropic API key in the sidebar first.")
             st.stop()
-        with st.spinner("🤖 Claude is reading your statement…"):
+        with st.spinner("Claude is reading the statement…"):
             try:
                 fmt, tx_count, issues, pages, buf, supplier = convert_ai(pdf_bytes, uploaded.name, api_key)
             except ValueError as e:
-                st.error(f"❌ {e}")
-                st.stop()
+                st.error(str(e)); st.stop()
             except json.JSONDecodeError as e:
-                st.error(f"❌ AI returned unexpected output: {e}. Try again, or lower PAGES_PER_CHUNK.")
+                st.error(f"The AI reply could not be read ({e}). Try again, or lower PAGES_PER_CHUNK.")
                 st.stop()
             except Exception as e:
-                st.error(f"❌ Unexpected error: {e}")
-                st.stop()
-        st.markdown(f"""<div class="ai-ok">
-        🤖 &nbsp;<b>AI extracted successfully!</b> &nbsp;·&nbsp;
-        📄 {pages} page(s) &nbsp;·&nbsp;
-        🧾 {tx_count} transactions &nbsp;·&nbsp;
-        🏢 {supplier}
-        </div>""", unsafe_allow_html=True)
+                st.error(f"Unexpected error: {e}"); st.stop()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Supplier", supplier[:22])
+        c2.metric("Pages", pages)
+        c3.metric("Transactions", tx_count)
         if issues:
-            st.warning(f"⚠️ {issues} line(s) don't tie to the running balance — check those rows against the PDF.")
+            st.warning(f"{issues} line(s) don't agree with the running balance. Check those rows against the PDF.")
         else:
-            st.success("✅ Every running balance ties — no lines missed.")
-        st.caption("✅ See the **AI Extraction Info** sheet in the Excel file for details.")
-        st.write("")
-        st.download_button(
-            "⬇️  Download AI-Extracted Excel",
-            data=buf,
-            file_name=Path(uploaded.name).stem+"_AI_extracted.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+            st.markdown('<div class="result">✓ Every running balance agrees</div>', unsafe_allow_html=True)
+        st.download_button("Download Excel", data=buf,
+                           file_name=Path(uploaded.name).stem + "_AI_extracted.xlsx", mime=XLSX_MIME)
     else:
-        with st.spinner("✨ Converting your statement…"):
+        with st.spinner("Converting…"):
             try:
-                fmt,tx_count,chq_count,pages,buf = convert(pdf_bytes)
+                fmt, tx_count, chq_count, pages, buf = convert(pdf_bytes)
             except Exception as e:
-                st.error(f"❌ Error: {e}"); st.stop()
+                st.error(f"Conversion failed: {e}"); st.stop()
         if fmt == "unknown":
-            st.warning("⚠️ Format not recognised by rule-based parser.")
-            st.markdown("""
-<div class="ai-banner" style="margin-top:12px">
-  <h3>💡 Try AI Mode</h3>
-  <p>Select <b>🤖 AI Mode</b> in the mode selector above and re-upload your PDF.
-  Claude will read and extract any statement format — no setup needed.</p>
-</div>""", unsafe_allow_html=True)
+            st.markdown('<div class="note"><b>This layout isn\'t one of the built-in suppliers.</b> '
+                        'Switch to <b>AI (any supplier)</b> above and it will read the statement.</div>',
+                        unsafe_allow_html=True)
         else:
-            labels = {
-                "savannah":"Savannah Cement","national":"National Cement",
-                "mombasa":"Mombasa Cement","karsan":"Karsan Ramji (Ndovu)",
-                "skylife":"Skylife Kenya","springtech":"Springtech (K) Ltd",
-                "scania":"Scania East Africa","transsolutions":"Trans-Solutions (E.A)",
-                "autoxpress":"AutoXpress Limited","gathani":"Gathani Limited",
-                "anco":"Anco Trading Ltd",
-                "coa":"Confirmation of Accounts",
-                "bamburi":"Bamburi Cement PLC",
-                "crown":"Crown Paints Kenya PLC",
-                "mapei":"Mapei East Africa Ltd",
-                "basco":"Basco Products (K) Ltd",
-                "dolphin":"Dolphin Ricambi Ltd",
-                "simba":"Simba Corporation Ltd",
-                "plascon":"Kansai Plascon Kenya Ltd",
-                "printan":"Printan Limited",
-            }
-            label   = labels.get(fmt, fmt)
-            chq_txt = f" · {chq_count} cheques" if chq_count else ""
-            st.markdown(
-                f"""<div class="ok">🎉 &nbsp;<b>{label}</b> converted successfully! &nbsp;·&nbsp;
-                📄 {pages} page(s) &nbsp;·&nbsp; 🧾 {tx_count} transactions{chq_txt}</div>""",
-                unsafe_allow_html=True,
-            )
-            st.write("")
-            st.download_button(
-                "⬇️  Download Excel File",
-                data=buf,
-                file_name=Path(uploaded.name).stem+"_converted.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Supplier", LABELS.get(fmt, fmt)[:22])
+            c2.metric("Pages", pages)
+            c3.metric("Transactions" + (f" · {chq_count} chq" if chq_count else ""), tx_count)
+            st.markdown('<div class="result">✓ Converted</div>', unsafe_allow_html=True)
+            st.download_button("Download Excel", data=buf,
+                               file_name=Path(uploaded.name).stem + "_converted.xlsx", mime=XLSX_MIME)
 
-st.markdown("---")
-st.markdown(
-    '<div class="footer-note">✨ Files processed in memory · never stored · free to use ✨</div>',
-    unsafe_allow_html=True,
-)
+st.write("")
+with st.expander(f"Built-in suppliers ({len(SUPPLIERS)})"):
+    st.markdown("| Supplier | Columns |\n|---|---|\n" +
+                "\n".join(f"| **{n}** | {c} |" for n, c in SUPPLIERS) +
+                "\n| **Any other** | Use AI mode |")
+
+st.markdown('<div class="foot">Files are processed in memory and never stored.</div>', unsafe_allow_html=True)
