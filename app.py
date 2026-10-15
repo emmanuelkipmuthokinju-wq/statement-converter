@@ -1,11 +1,14 @@
 import streamlit as st
-import io, re, json, os
+import io, re, json, os, base64
+import urllib.request, urllib.error
 import pdfplumber
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from pathlib import Path
+
 st.set_page_config(page_title="Statement PDF → Excel", page_icon="📄", layout="centered")
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700;800&display=swap');
@@ -67,6 +70,7 @@ section[data-testid="stFileUploaderDropzone"]{
 }
 </style>
 """, unsafe_allow_html=True)
+
 st.markdown("""
 <div class="hero">
   <h1>📄✨ Statement → Excel</h1>
@@ -90,9 +94,11 @@ st.markdown("""
   <span class="badge">🐬 Dolphin Ricambi</span>
   <span class="badge">🦁 Simba Corp</span>
   <span class="badge">🎨 Kansai Plascon</span>
+  <span class="badge">🖨️ Printan</span>
   <span class="badge">🔒 Files never stored</span>
 </div>
 """, unsafe_allow_html=True)
+
 with st.expander("🎨 Supported formats"):
     st.markdown("""
 | Supplier | Key Columns |
@@ -116,7 +122,10 @@ with st.expander("🎨 Supported formats"):
 | 🐬 **Dolphin Ricambi Ltd** | Tally-style ledger: Date · Particulars · Vch Type · Vch No · Excise Inv No · Narration · Debit · Credit · Running Balance |
 | 🦁 **Simba Corporation Ltd** | Posting Date · Reference/LPO · Veh Reg · Document No · CU Invoice No · Description · Due Date · Original Amt · Remaining Amt · Balance + Aged Summary sheet |
 | 🎨 **Kansai Plascon Kenya Ltd** | Doc Type (IN/JE/RC) · Document No · BP Ref. No. · Post. Date · Due Date · Details · Amount · Balance (wrapped BP refs handled) + Ageing Summary sheet |
+| 🖨️ **Printan Limited** | Date · Transaction · Document No · Due Date · Amount · Payments · Balance + Payment Allocation sheet + summary check against the PDF |
+| 🤖 **Any other supplier** | AI Mode — Claude reads the statement in page chunks and checks every running balance |
     """)
+
 # ── Colours & helpers ──────────────────────────────────────────────────────────
 C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20",
          karsan_purple="4A148C", header_dark="2C3E50", col_hdr_fg="FFFFFF",
@@ -127,29 +136,35 @@ C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20
          transsolutions_cyan="0097A7", autoxpress_amber="F57C00",
          gathani_maroon="7B1C1C", anco_teal="00695C", bamburi_green="00843D",
          crown_red="C8102E", mapei_blue="005CA9", basco_blue="0D47A1",
-         dolphin_navy="0D3B66", simba_red="B71C1C", plascon_red="D0112B")
+         dolphin_navy="0D3B66", simba_red="B71C1C", plascon_red="D0112B",
+         printan_navy="1F3864")
 MFMT = '#,##0.00;(#,##0.00);"-"'
 IFMT = '#,##0;(#,##0);"-"'
+
 def pnf(s):
-    """General money parser: handles leading/trailing '-', commas, currency prefixes."""
+    """General money parser: handles leading/trailing '-', (brackets), commas, currency prefixes."""
     if s is None: return None
     s = str(s).strip()
     if not s: return None
     neg = False
+    if s.startswith("(") and s.endswith(")"): neg = True; s = s[1:-1]
     if s.startswith("-"): neg = True; s = s[1:]
     if s.endswith("-"): neg = True; s = s[:-1]
     s = s.replace(",", "").replace("KES", "").replace("KShs", "").strip()
     try: v = float(s)
     except: return None
     return -v if neg else v
+
 def thin(sides="all"):
     s = Side(style="thin", color=C["border"])
     kw = dict(left=s,right=s,top=s,bottom=s) if sides=="all" else dict(bottom=s)
     return Border(**kw)
+
 def pn(s):
     if s is None: return None
     try: return float(str(s).strip().replace(",","").replace("-","").strip()) * (-1 if str(s).strip().endswith("-") else 1)
     except: return None
+
 def wc(ws, r, c, v=None, bold=False, fg="000000", bg=None, align="left",
        fmt=None, bdr=None, sz=9, ind=0):
     cell = ws.cell(row=r, column=c, value=v)
@@ -159,18 +174,22 @@ def wc(ws, r, c, v=None, bold=False, fg="000000", bg=None, align="left",
     if fmt: cell.number_format = fmt
     if bdr: cell.border = bdr
     return cell
+
 def banner(ws, row, cols, text, bg):
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=cols)
     wc(ws, row, 1, text, bold=True, fg=C["col_hdr_fg"], bg=bg, align="center", sz=14)
     ws.row_dimensions[row].height = 30
+
 def col_headers(ws, row, headers, bg):
     for ci, h in enumerate(headers, 1):
         wc(ws, row, ci, h, bold=True, fg=C["col_hdr_fg"], bg=bg, align="center", bdr=thin())
     ws.row_dimensions[row].height = 22
+
 # ── FORMAT DETECTION ───────────────────────────────────────────────────────────
 def detect(lines):
     t = "\n".join(lines[:50])
     tfull = "\n".join(lines[:150])
+    if "PRINTAN" in t.upper():                                         return "printan"
     if "KANSAI PLASCON" in tfull.upper() or "PLASCON" in t.upper():   return "plascon"
     if "DOLPHIN RICAMBI" in tfull.upper() or "DOLPHIN" in t.upper():     return "dolphin"
     if "SIMBA CORP" in tfull.upper():                                     return "simba"
@@ -195,11 +214,13 @@ def detect(lines):
     if "Confirmation of Accounts" in t or "Doshi" in t or "Ultra Multiware" in t: return "coa"
     if re.search(r"Date\s+Particulars\s+Debit Amount", t):                 return "coa"
     return "unknown"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MOMBASA CEMENT PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 DATE_MCL = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 MONEY_RE  = re.compile(r"^-?[\d,]+\.\d{2}-?$")
+
 def parse_mombasa(lines):
     hdr = {"supplier": "Mombasa Cement Limited", "account": "", "account_no": "",
            "currency": "KES", "period": ""}
@@ -258,6 +279,7 @@ def parse_mombasa(lines):
                     "description": desc, "amount": amount, "balance": balance,
                     "section": section, "is_receipt": is_receipt})
     return hdr, txs
+
 def excel_mombasa(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active
     ws.title = "Statement"; ws.sheet_properties.tabColor = C["mombasa_green"]
@@ -310,6 +332,7 @@ def excel_mombasa(hdr, txs):
     ws.freeze_panes=f"A{D}"; ws.auto_filter.ref=f"A{H}:G{T-1}"
     ws.page_setup.orientation="landscape"; ws.page_setup.fitToPage=True; ws.page_setup.fitToWidth=1
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DOLPHIN RICAMBI LIMITED PARSER  (Tally-style ledger: To/By debit/credit,
 # multi-period opening & closing balances, invoice detail wrapped on next line)
@@ -317,6 +340,7 @@ def excel_mombasa(hdr, txs):
 DATE_DOL  = re.compile(r"^\d{1,2}-\d{1,2}-\d{4}$")      # 1-5-2026 / 15-5-2026
 MONEY_DOL = re.compile(r"^[\d,]+\.\d{2}$")
 VTYPE_SINGLE = {"Sales", "Receipt", "Journal", "Payment", "Contra", "Purchase"}
+
 def parse_dolphin(lines):
     hdr = {"supplier": "Dolphin Ricambi Limited", "customer": "", "period": "",
            "po_box": "", "tel": "", "opening_balance": None, "closing_balance": None}
@@ -385,6 +409,7 @@ def parse_dolphin(lines):
                     "debit": amount if side == "To" else None,
                     "credit": amount if side == "By" else None})
     return hdr, txs
+
 def excel_dolphin(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
     ws.sheet_properties.tabColor = C["dolphin_navy"]
@@ -443,6 +468,7 @@ def excel_dolphin(hdr, txs):
     ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:I{T-1}"
     ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIMBA CORPORATION LIMITED PARSER
 # Wide columnar layout: Posting Date | Reference/LPO | Veh Reg | Document No. |
@@ -455,6 +481,7 @@ MONEY_SMB = re.compile(r"^-?[\d,]+\.\d{2}$")
 DOC_SMB   = re.compile(r"^(SPV|SPR|SPA|SPN|GJVP|GJV|GRV|GIV|SIV)-?\d+$")
 VEH_SMB   = re.compile(r"^K[A-Z]{2}\d{3}[A-Z]$")
 FRAG_SMB  = re.compile(r"^[A-Za-z0-9\-/]+$")
+
 def parse_simba(lines):
     hdr = {"supplier": "Simba Corporation Limited", "customer": "", "customer_no": "",
            "statement_no": "", "document_date": "", "start_date": "", "end_date": "",
@@ -529,6 +556,7 @@ def parse_simba(lines):
             t["reference"] = (t["reference"] + " " + "".join(t["frags"])).strip()
         del t["frags"]
     return hdr, txs
+
 def excel_simba(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
     ws.sheet_properties.tabColor = C["simba_red"]
@@ -603,11 +631,13 @@ def excel_simba(hdr, txs):
                fg=C["neg_bal"] if (val or 0) < 0 else "000000", bg=bg2)
             ws2.row_dimensions[ri].height = 16
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # KARSAN RAMJI PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 DATE_KRS = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 MONEY_KRS= re.compile(r"^-?[\d,]+\.\d{2}$")
+
 def parse_karsan(lines):
     hdr = {"supplier":"Karsan Ramji and Sons Ltd","customer":"","customer_code":"",
            "phone":"","email":"","period":""}
@@ -653,6 +683,7 @@ def parse_karsan(lines):
         txs.append({"date":date,"doc_no":doc_no,"bp_ref":bp_ref,"cu_invoice":cu_inv,
                     "line_memo":memo,"debit":dbt,"credit":crd,"balance":bal,"is_bf":False})
     return hdr, txs
+
 def excel_karsan(hdr, txs):
     wb=openpyxl.Workbook(); ws=wb.active
     ws.title="Statement"; ws.sheet_properties.tabColor=C["karsan_purple"]
@@ -703,6 +734,7 @@ def excel_karsan(hdr, txs):
     ws.freeze_panes=f"A{D}"; ws.auto_filter.ref=f"A{H}:H{T-1}"
     ws.page_setup.orientation="landscape"; ws.page_setup.fitToPage=True; ws.page_setup.fitToWidth=1
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # NATIONAL CEMENT PARSER  (precise column-aware parser)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -710,6 +742,7 @@ DR4     = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
 MONEY_N = re.compile(r"^[\d,]+\.\d{2}$")
 QTY_N   = re.compile(r"^\d+\.\d{3}$")
 LPOSUF  = re.compile(r"^\d{7,8}$")
+
 def parse_national(lines):
     hdr = {}
     for ln in lines[:20]:
@@ -795,6 +828,7 @@ def parse_national(lines):
                     "balance_disp":balance_disp,"is_bf":False})
         i += 1
     return hdr, txs, chqs
+
 def excel_national(hdr,txs,chqs):
     wb=openpyxl.Workbook(); ws=wb.active; ws.title="Statement"
     ws.sheet_properties.tabColor=C["national_blue"]
@@ -871,11 +905,13 @@ def excel_national(hdr,txs,chqs):
         c.number_format=MFMT; c.alignment=Alignment(horizontal="right",vertical="center"); c.border=thin()
         ws2.row_dimensions[CR].height=18
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SAVANNAH CEMENT PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 DR2=re.compile(r"^\d{2}\.\d{2}\.\d{2}$"); MR2=re.compile(r"^-?[\d,]+\.\d{2}$")
 PFX=("IN ","CN ","RC ","DN ")
+
 def parse_savannah(lines):
     hdr={"customer_name":"New Muthokinju Hardware Ltd","customer_code":"LC000072",
          "credit_limit":2_000_000.00,"sales_employee":"Fred Oguttu",
@@ -917,6 +953,7 @@ def parse_savannah(lines):
                     "date":d,"due_date":dd,"details":" ".join(dps).strip() or "A/R Invoices",
                     "debit":dbt,"credit":crd,"balance":bal})
     return hdr,txs
+
 def excel_savannah(hdr,txs):
     wb=openpyxl.Workbook(); ws=wb.active; ws.title="Statement"
     ws.sheet_properties.tabColor=C["savannah_orange"]
@@ -966,6 +1003,7 @@ def excel_savannah(hdr,txs):
     ws.freeze_panes=f"A{D}"; ws.auto_filter.ref=f"A{H}:I{T-1}"
     ws.page_setup.orientation="landscape"; ws.page_setup.fitToPage=True; ws.page_setup.fitToWidth=1
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SKYLIFE KENYA LIMITED PARSER  (Tally-style ledger: To/By, Vch Type, Vch No.)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -975,6 +1013,7 @@ VCHNO_SKY = re.compile(r"^[A-Z0-9]{6,}$")
 SKIP_SKY = ("Skylife Kenya Limited", "P.O.Box No.", "Nairobi, Kenya",
             "NEW MUTHOKINJU HARDWARE LTD", "Ledger Account", "Page", "continued",
             "Date Particulars")
+
 def parse_skylife(lines):
     hdr = {"supplier": "Skylife Kenya Limited", "customer": "New Muthokinju Hardware Ltd",
            "period": "", "closing_balance": None}
@@ -1012,6 +1051,7 @@ def parse_skylife(lines):
                     "debit": amount if side == "Debit" else None,
                     "credit": amount if side == "Credit" else None})
     return hdr, txs
+
 def excel_skylife(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
     ws.sheet_properties.tabColor = C["skylife_teal"]
@@ -1068,11 +1108,13 @@ def excel_skylife(hdr, txs):
     ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:F{T-1}"
     ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # GENERIC "AGING STATEMENT" PARSER  (Springtech and Trans-Solutions)
 # ══════════════════════════════════════════════════════════════════════════════
 DATE_AG = re.compile(r"^\d{2}[-/]\d{2}[-/]\d{4}$")
 MONEY_AG = re.compile(r"^-?[\d,]+\.\d{2}$")
+
 def parse_aging_rows(lines):
     txs = []
     for ln in lines:
@@ -1094,6 +1136,7 @@ def parse_aging_rows(lines):
         txs.append({"date": parts[0], "description": desc.strip() or "—",
                     "amount": amount, "balance": balance})
     return txs
+
 def parse_aging_summary(full_text):
     m = re.search(r"(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})\s+"
                    r"(-?[\d,]+\.\d{2})\s+(-?[\d,]+\.\d{2})", full_text)
@@ -1105,6 +1148,7 @@ def parse_aging_summary(full_text):
     m2 = re.search(r"Amount Due[^\d\-]*(-?(?:KES|KShs)?\s*[\d,]+\.\d{2})", full_text)
     if m2: amt = pnf(m2.group(1))
     return buckets, amt
+
 def parse_springtech(lines):
     hdr = {"supplier": "Springtech (K) Ltd", "address": "P.O. Box 94089 - 80107, Mombasa, Kenya",
            "customer": "New Muthokinju Hardware Ltd", "currency": "KES"}
@@ -1113,6 +1157,7 @@ def parse_springtech(lines):
     m = re.search(r"Date\s*\n?\s*(\d{2}-\d{2}-\d{4})", full)
     if m: hdr["statement_date"] = m.group(1)
     return hdr, parse_aging_rows(lines)
+
 def parse_transsolutions(lines):
     hdr = {"supplier": "Trans-Solutions (E.A) Ltd", "address": "P.O.Box 17634, Kenya 00500",
            "customer": "New Muthokinju Hardware Limited", "currency": "KES"}
@@ -1123,6 +1168,7 @@ def parse_transsolutions(lines):
     m = re.search(r"PAYBILL NO:\s*([\d\s]+)", full)
     if m: hdr["paybill"] = re.sub(r"\s+", "", m.group(1))
     return hdr, parse_aging_rows(lines)
+
 def excel_aging_statement(hdr, txs, tab_color, banner_text):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
     ws.sheet_properties.tabColor = tab_color
@@ -1135,10 +1181,6 @@ def excel_aging_statement(hdr, txs, tab_color, banner_text):
     info = [("Customer", hdr.get("customer", ""), "Statement Date", hdr.get("statement_date", "")),
             ("Supplier", hdr.get("supplier", ""), "Currency", hdr.get("currency", "KES"))]
     for r, (l1, v1, l2, v2) in enumerate(info, start=2):
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=1)
-        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=2)
-        ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=3)
-        ws.merge_cells(start_row=r, start_column=4, end_row=r, end_column=4)
         lc = ws.cell(row=r, column=1, value=l1); lc.font=lf; lc.fill=lb; lc.alignment=al
         vc = ws.cell(row=r, column=2, value=v1); vc.font=vf; vc.alignment=al
         lc2 = ws.cell(row=r, column=3, value=l2); lc2.font=lf; lc2.fill=lb; lc2.alignment=al
@@ -1190,6 +1232,7 @@ def excel_aging_statement(hdr, txs, tab_color, banner_text):
                fg=C["neg_bal"] if (val or 0) < 0 else "000000", bg=C["info_bg"] if bold else None)
             ws2.row_dimensions[ri].height = 16
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SCANIA EAST AFRICA LIMITED PARSER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1201,6 +1244,7 @@ SKIP_SC = ("Scania East Africa", "VAT Registration", "Mombasa Rd", "P.O.Box", "N
            "Terms of payment", "Currency", "From date", "To date", "New Muthokinju",
            "P O Box", "Bonje", "Harvester Road", "Tairi Mbili", "Date Invoice Description",
            "+254")
+
 def parse_scania_row(toks):
     if toks[0] in ("Opening", "Closing"):
         try: kes_idx = toks.index("KES")
@@ -1224,6 +1268,7 @@ def parse_scania_row(toks):
     balance = pnf(money[2]) if len(money) > 2 else None
     return {"label": "", "date": date, "invoice": invoice, "description": desc, "due_date": due_date,
             "debit": debit, "credit": credit, "balance": balance, "is_summary": False}
+
 def parse_scania(lines):
     hdr = {"customer": "New Muthokinju", "account": "", "terms": "", "currency": "KES",
            "from_date": "", "to_date": "", "tax_reg": ""}
@@ -1257,6 +1302,7 @@ def parse_scania(lines):
                 i += 1
         txs.append(tx); i += 1
     return hdr, txs
+
 def excel_scania(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
     ws.sheet_properties.tabColor = C["scania_red"]
@@ -1271,7 +1317,6 @@ def excel_scania(hdr, txs):
             ("From Date", hdr.get("from_date", ""), "To Date", hdr.get("to_date", ""))]
     for r, (l1, v1, l2, v2) in enumerate(info, start=2):
         for ci, lbl, val in [(1, l1, v1), (4, l2, v2)]:
-            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci)
             ws.merge_cells(start_row=r, start_column=ci+1, end_row=r, end_column=ci+2)
             lc = ws.cell(row=r, column=ci, value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
             vc = ws.cell(row=r, column=ci+1, value=val); vc.font=vf; vc.alignment=al
@@ -1315,6 +1360,7 @@ def excel_scania(hdr, txs):
     ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:G{T-1}"
     ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAPEI EAST AFRICA LTD PARSER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1327,6 +1373,7 @@ SKIP_MPI  = ("Mapei East Africa", "Account statement", "Riverside", "Wing A",
              "Currency KES", "From date", "To date", "Credit limit",
              "Credit available", "P.O. BOX", "P.O.BOX",
              "Date Invoice Description")
+
 def parse_mapei(lines):
     hdr = {"supplier": "Mapei East Africa Ltd.", "customer": "", "account": "",
            "terms": "", "currency": "KES", "credit_limit": None,
@@ -1403,6 +1450,7 @@ def parse_mapei(lines):
                     "due_date": due_date, "debit": debit, "credit": credit,
                     "balance": balance, "is_summary": False})
     return hdr, txs
+
 def excel_mapei(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
     ws.sheet_properties.tabColor = C["mapei_blue"]
@@ -1421,7 +1469,6 @@ def excel_mapei(hdr, txs):
             ("Statement Date", hdr.get("statement_datetime", ""), "Currency", hdr.get("currency", "KES"))]
     for r, (l1, v1, l2, v2) in enumerate(info, start=2):
         for ci, lbl, val in [(1, l1, v1), (4, l2, v2)]:
-            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci)
             ws.merge_cells(start_row=r, start_column=ci+1, end_row=r, end_column=ci+2)
             lc = ws.cell(row=r, column=ci, value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
             vc = ws.cell(row=r, column=ci+1, value=val); vc.font=vf; vc.alignment=al
@@ -1469,6 +1516,7 @@ def excel_mapei(hdr, txs):
     ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:G{T-1}"
     ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BAMBURI CEMENT PLC PARSER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1480,8 +1528,10 @@ DOCTYPE_BC = {
     ("Accounting","Docum"):     "Accounting Document",
     ("Customer","Paymen"):      "Customer Payment",
 }
+
 def is_money_bc(tok):
     return bool(tok) and bool(MONEY_BC.match(tok)) and any(ch.isdigit() for ch in tok)
+
 def parse_bamburi_row(toks):
     if len(toks) < 4: return None
     bal_tok, amt_tok = toks[-1], toks[-2]
@@ -1522,6 +1572,7 @@ def parse_bamburi_row(toks):
     return {"doc_number": doc_number, "delivery_note": delivery_note, "date": date_str,
             "doc_type": doctype, "item_text": " ".join(item_rest), "qty": qty, "unit": unit,
             "amount": amount, "balance": balance}
+
 def parse_bamburi(lines):
     hdr = {"customer": "", "po_box": "", "location": "", "statement_date": "",
            "period": "", "opening_balance": None, "closing_balance": None, "pin": ""}
@@ -1562,6 +1613,7 @@ def parse_bamburi(lines):
         elif txs and not is_money_bc(toks[-1]):
             txs[-1]["item_text"] = (txs[-1]["item_text"] + " " + s).strip()
     return hdr, txs
+
 def excel_bamburi(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
     ws.sheet_properties.tabColor = C["bamburi_green"]
@@ -1575,7 +1627,6 @@ def excel_bamburi(hdr, txs):
             ("PO Box", hdr.get("po_box", ""), "Location", hdr.get("location", "")),
             ("Period", hdr.get("period", ""), "Statement Date", hdr.get("statement_date", ""))]
     for r, (l1, v1, l2, v2) in enumerate(info, start=2):
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=1)
         ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=4)
         ws.merge_cells(start_row=r, start_column=5, end_row=r, end_column=6)
         ws.merge_cells(start_row=r, start_column=7, end_row=r, end_column=9)
@@ -1619,6 +1670,7 @@ def excel_bamburi(hdr, txs):
     ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:I{T-1}"
     ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # AUTOXPRESS LIMITED PARSER  (date wraps across 3 lines: "DD-MM-", data, "YYYY")
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1626,6 +1678,7 @@ DATE_PREFIX_AX = re.compile(r"^\d{2}-\d{2}-$")
 YEAR_AX = re.compile(r"^\d{4}$")
 TAXINV_AX = re.compile(r"^\d{15,}$")
 LPO_AX = re.compile(r"^(POHH|XNB)")
+
 def parse_autoxpress(lines):
     hdr = {"account_no": "", "customer": "New Muthokinju Hardware", "email": "", "tpin": "",
            "sales_group": "", "pay_term": "", "currency": "KES", "credit_limit": None,
@@ -1676,6 +1729,7 @@ def parse_autoxpress(lines):
                             "payment": payment, "cumulative": cumulative})
         i += 1
     return hdr, txs
+
 def excel_autoxpress(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
     ws.sheet_properties.tabColor = C["autoxpress_amber"]
@@ -1693,7 +1747,6 @@ def excel_autoxpress(hdr, txs):
     for r, (l1, v1, l2, v2) in enumerate(info, start=2):
         for ci, lbl, val in [(1, l1, v1), (5, l2, v2)]:
             ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci+1)
-            ws.merge_cells(start_row=r, start_column=ci+2, end_row=r, end_column=ci+2)
             lc = ws.cell(row=r, column=ci, value=lbl); lc.font=lf; lc.fill=lb; lc.alignment=al
             vc = ws.cell(row=r, column=ci+2, value=val); vc.font=vf; vc.alignment=al
         ws.row_dimensions[r].height = 16
@@ -1746,11 +1799,13 @@ def excel_autoxpress(hdr, txs):
                fg=C["neg_bal"] if (val or 0) < 0 else "000000", bg=C["info_bg"] if bold else None)
             ws2.row_dimensions[ri].height = 16
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # GATHANI LIMITED PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 DATE_GTH = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{2}$")
 MONEY_GTH = re.compile(r"^[\d,]+\.\d{2}$")
+
 def parse_gathani(lines):
     hdr = {"supplier": "Gathani Limited", "customer": "", "address": "", "contact": "",
            "as_at": "", "pin": "", "buckets": {}}
@@ -1817,6 +1872,7 @@ def parse_gathani(lines):
                 particulars = " ".join(desc_parts)
         is_credit = "Credit" in particulars or "credit" in particulars
         debit = credit = nett = None
+        nett_drcr = ""
         if len(money_vals) >= 2:
             nett, nett_drcr = money_vals[-1]
             tx_amt, tx_drcr = money_vals[-2]
@@ -1831,9 +1887,10 @@ def parse_gathani(lines):
         txs.append({
             "date": date, "particulars": particulars, "doc_ref": doc_ref,
             "debit": debit, "credit": credit, "nett_amount": nett,
-            "drcr": nett_drcr if len(money_vals) >= 1 else "", "is_opening": False
+            "drcr": nett_drcr, "is_opening": False
         })
     return hdr, txs
+
 def excel_gathani(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active
     ws.title = "Statement"; ws.sheet_properties.tabColor = C["gathani_maroon"]
@@ -1909,11 +1966,13 @@ def excel_gathani(hdr, txs):
     ws.freeze_panes=f"A{D}"; ws.auto_filter.ref=f"A{H}:F{T-1}"
     ws.page_setup.orientation="landscape"; ws.page_setup.fitToPage=True; ws.page_setup.fitToWidth=1
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ANCO TRADING LTD PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 DATE_ANCO  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 MONEY_ANCO = re.compile(r"^[\d,]+\.\d{2}$")
+
 def parse_anco(lines):
     hdr = {"supplier": "Anco Trading Ltd", "customer": "", "client_code": "", "email": "",
            "pin": "", "credit_days": "", "credit_limit": "",
@@ -1940,8 +1999,6 @@ def parse_anco(lines):
         if m: hdr["period"] = f"{m.group(1)} to {m.group(2)}"
         m = re.search(r"TOTAL OUTSTANDING\s+([\d,]+\.\d{2})", ln)
         if m: hdr["total_outstanding"] = pnf(m.group(1))
-        m = re.search(r"0-30 days\s+30-60 days\s+60-90 days\s+<90 days\s+Total", ln, re.I)
-        if m: _ageing_next = True
     for i, ln in enumerate(lines):
         if re.search(r"0-30 days", ln, re.I) and i+1 < len(lines):
             nums = re.findall(r"[\d,]+\.\d{2}", lines[i+1])
@@ -1994,6 +2051,7 @@ def parse_anco(lines):
             "is_opening": False
         })
     return hdr, txs
+
 def excel_anco(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active
     ws.title = "Statement"; ws.sheet_properties.tabColor = C["anco_teal"]
@@ -2073,12 +2131,14 @@ def excel_anco(hdr, txs):
     ws.freeze_panes=f"A{D}"; ws.auto_filter.ref=f"A{H}:H{T-1}"
     ws.page_setup.orientation="landscape"; ws.page_setup.fitToPage=True; ws.page_setup.fitToWidth=1
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CROWN PAINTS KENYA PLC PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 DATE_CRN  = re.compile(r"^\d{1,2}-[A-Za-z]{3}-\d{2}$")
 MONEY_CRN = re.compile(r"^-?[\d,]+\.\d{2}$")
 DESC_CRN  = ("A/R Credit Memo", "A/R Invoice", "Incoming Payment")
+
 def parse_crown(lines):
     full = "\n".join(lines)
     hdr = {"supplier": "Crown Paints Kenya PLC", "account_code": "", "customer": "",
@@ -2178,6 +2238,7 @@ def parse_crown(lines):
                     "debit": debit, "credit": credit, "balance": balance, "is_opening": False})
         i = j if j > i + 1 else i + 1
     return hdr, txs, products
+
 def excel_crown(hdr, txs, products):
     wb = openpyxl.Workbook(); ws = wb.active
     ws.title = "Statement"; ws.sheet_properties.tabColor = C["crown_red"]
@@ -2284,6 +2345,7 @@ def excel_crown(hdr, txs, products):
         ws3.freeze_panes = "A3"; ws3.auto_filter.ref = f"A2:G{T3 - 1}"
         ws3.page_setup.orientation = "landscape"; ws3.page_setup.fitToPage = True; ws3.page_setup.fitToWidth = 1
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIRMATION OF ACCOUNTS PARSER  (Doshi / Ultra Multiware — two-column layout)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2293,6 +2355,7 @@ CU_COA    = re.compile(r"^\d{16,19}$")
 SKIP_COA = {"Date","Particulars","Debit","Amount","Credit","Dear","Sub:",
             "Given","Kindly","Please","period.","I/We","P.O","P.O.BOX",
             "NAIROBI","To","From:","continued","Page"}
+
 def parse_coa(lines):
     hdr = {"supplier": "", "customer": "New Muthokinju Hardware Limited",
            "date": "", "period": "", "currency": "KES", "closing_balance": None}
@@ -2351,8 +2414,9 @@ def parse_coa(lines):
                 cr_desc   = " ".join(parts[cr_date_pos+1:cr_money_pos])
                 credits.append({"date": cr_date, "particulars": cr_desc, "amount": cr_amount})
     return hdr, debits, credits, ageing
+
 def excel_coa(hdr, debits, credits, ageing):
-    supplier = hdr.get("supplier", "Supplier Statement")
+    supplier = hdr.get("supplier", "Supplier Statement") or "Supplier Statement"
     COA_COLOR = "1A237E"
     COA_DR    = "BF360C"
     COA_CR    = "1B5E20"
@@ -2468,12 +2532,14 @@ def excel_coa(hdr, debits, credits, ageing):
                fg=C["debit_fg"],bg=bg2,bold=bold)
             ws2.row_dimensions[ri].height=16
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # BASCO PRODUCTS (K) LTD PARSER  (multi-account merged statements: NE29, NE35 …)
 # ══════════════════════════════════════════════════════════════════════════════
 DATE_BSC  = re.compile(r"^\d{2}/\d{2}/\d{4}$")
 MONEY_BSC = re.compile(r"^[\d,]+\.\d{2}-?$")
 TYPES_BSC = {"Invoice", "Paymnt", "Adjmnt", "Credit", "Crnote", "Journal", "Dbnote"}
+
 def parse_basco(lines):
     hdr = {"customer_name": "", "statement_date": "", "currency": "KES",
            "terms": "", "accounts": [], "aging": []}
@@ -2532,6 +2598,7 @@ def parse_basco(lines):
                     "ref": ref, "debit": debit, "credit": credit, "balance": bal})
         i += 1
     return hdr, txs
+
 def excel_basco(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
     ws.sheet_properties.tabColor = C["basco_blue"]
@@ -2607,6 +2674,7 @@ def excel_basco(hdr, txs):
             c.number_format = MFMT
             c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # KANSAI PLASCON KENYA LIMITED PARSER  (SAP Business One customer statement)
 # Row layout: Doc Type (IN/JE/RC) · Document No · BP Ref. No. · Post. Date ·
@@ -2622,6 +2690,7 @@ SKIP_KP  = ("KANSAI PLASCON", "KENYA LIMITED", "Posting Date", "Aged By", "Custo
             "Document BP Ref", "Phone #", "Fax #", "Address:", "Connected BP",
             "Page:", "Printed By", "Balance Due Future Remit", "Ageing (%)",
             "NEW MUTHOKINJU HARDWARE LTD")
+
 def parse_plascon(lines):
     hdr = {"supplier": "Kansai Plascon Kenya Limited", "customer": "", "bp_code": "",
            "statement_date": "", "ageing_date": "", "aged_by": "", "sales_employee": "",
@@ -2655,7 +2724,6 @@ def parse_plascon(lines):
             continue
         if any(k in s for k in SKIP_KP): continue
         parts = s.split()
-        # transaction row: DOCTYPE DOCNO [BP REF …] POST.DATE DUE.DATE DETAILS AMOUNT [BALANCE]
         if len(parts) >= 2 and parts[0] in DOC_KP and re.match(r"^\d{6,}$", parts[1]):
             date_idx = [j for j, p in enumerate(parts) if DATE_KP.match(p)]
             if len(date_idx) < 2: continue
@@ -2677,10 +2745,10 @@ def parse_plascon(lines):
                         "post_date": post_date, "due_date": due_date, "details": details,
                         "amount": amount, "balance": balance})
         else:
-            # continuation fragment of a wrapped BP reference
             if txs and not any(MONEY_KP.match(p) for p in parts) and len(s) <= 30:
                 txs[-1]["bp_ref"] = (txs[-1]["bp_ref"] + " " + s).strip()
     return hdr, txs
+
 def excel_plascon(hdr, txs):
     wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
     ws.sheet_properties.tabColor = C["plascon_red"]
@@ -2697,7 +2765,6 @@ def excel_plascon(hdr, txs):
     for r, (l1, v1, l2, v2) in enumerate(info, start=2):
         for ci, lbl, val in [(1, l1, v1), (5, l2, v2)]:
             ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci + 1)
-            ws.merge_cells(start_row=r, start_column=ci + 2, end_row=r, end_column=ci + 2)
             lc = ws.cell(row=r, column=ci, value=lbl); lc.font = lf; lc.fill = lb; lc.alignment = al
             vc = ws.cell(row=r, column=ci + 2, value=val); vc.font = vf; vc.alignment = al
         ws.row_dimensions[r].height = 16
@@ -2755,6 +2822,137 @@ def excel_plascon(hdr, txs):
                fg=C["neg_bal"] if (val or 0) < 0 else "000000", bg=bg2)
             ws2.row_dimensions[ri].height = 16
     buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRINTAN LIMITED PARSER  (table-based: Date · Transactions · Details · Amount ·
+#   Payments · Balance — details wrap inside the cell, credit notes in brackets,
+#   payment/credit-note lines list "KES x for payment of PLxxxxx" allocations)
+# ══════════════════════════════════════════════════════════════════════════════
+def parse_printan(pdf_bytes, lines):
+    full = "\n".join(lines)
+    hdr = {"supplier": "Printan Limited", "customer": "", "pin": "", "period": "",
+           "opening_balance": None, "invoiced": None, "received": None, "balance_due": None}
+    m = re.search(r"To\s*\n\s*(.+?)\n.*?\n\s*(.+?)\n\s*PIN:\s*(\S+)\s+(\d{2}/\d{2}/\d{4})\s+To\s+(\d{2}/\d{2}/\d{4})", full, re.S)
+    if m:
+        hdr["customer"] = f"{m.group(1).strip()} {m.group(2).strip()}"
+        hdr["pin"] = m.group(3); hdr["period"] = f"{m.group(4)} to {m.group(5)}"
+    for key, label in [("opening_balance", "Opening Balance"), ("invoiced", "Invoiced Amount"),
+                       ("received", "Amount Received"), ("balance_due", "Balance Due")]:
+        m = re.search(label + r"\s+KES\s+([\d,]+\.\d{2})", full)
+        if m: hdr[key] = pnf(m.group(1))
+    txs = []; alloc = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                for row in table:
+                    if not row or len(row) != 6 or not row[0] or row[0] == "Date": continue
+                    if not re.match(r"^\d{2}/\d{2}/\d{4}$", row[0].strip()): continue
+                    date, ttype, det, amt, pay, bal = [(c or "").replace("\n", " ").strip() for c in row]
+                    det_nospace = (row[2] or "").replace("\n", "").strip()
+                    doc = ""; due = ""
+                    m = re.match(r"^(\S+)\s*-\s*due on\s*(\d{2}/\d{2}/\d{4})", det_nospace)
+                    if m: doc, due = m.group(1), m.group(2)
+                    parts = re.findall(r"KES ([\d,]+\.\d{2}) for\s*payment\s*of\s*(PL\d+)", det)
+                    if parts:
+                        ref = "Payment" if "Payment" in ttype else ttype
+                        if "Credit" in ttype:
+                            mcn = re.match(r"^(\d+)\s*KES", det_nospace)
+                            if mcn: doc = "CN " + mcn.group(1); ref = doc
+                        for a, inv in parts:
+                            alloc.append({"date": date, "type": ttype, "ref": ref, "invoice": inv, "amount": pnf(a)})
+                        det = "; ".join(f"KES {a} for payment of {inv}" for a, inv in parts)
+                    if ttype.startswith("***"): ttype = "Opening Balance"
+                    txs.append({"date": date, "type": ttype, "doc": doc, "due": due,
+                                "amount": pnf(amt), "payment": pnf(pay), "balance": pnf(bal),
+                                "details": det if not doc or parts else ""})
+    return hdr, txs, alloc
+
+def excel_printan(hdr, txs, alloc):
+    col = C["printan_navy"]
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Statement"
+    ws.sheet_properties.tabColor = col
+    for i, w in enumerate([12, 17, 14, 12, 16, 16, 17, 55], 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    banner(ws, 1, 8, "PRINTAN LIMITED  |  STATEMENT OF ACCOUNTS", col)
+    lf = Font(name="Arial", bold=True, size=9); vf = Font(name="Arial", size=9)
+    lb = PatternFill("solid", start_color=C["info_bg"])
+    al = Alignment(horizontal="left", vertical="center", indent=1)
+    info = [("Customer", hdr.get("customer", ""), "PIN", hdr.get("pin", "")),
+            ("Period", hdr.get("period", ""), "Currency", "KES")]
+    for r, (l1, v1, l2, v2) in enumerate(info, start=2):
+        for ci, lbl, val in [(1, l1, v1), (5, l2, v2)]:
+            ws.merge_cells(start_row=r, start_column=ci, end_row=r, end_column=ci + 1)
+            lc = ws.cell(row=r, column=ci, value=lbl); lc.font = lf; lc.fill = lb; lc.alignment = al
+            vc = ws.cell(row=r, column=ci + 2, value=val); vc.font = vf; vc.alignment = al
+        ws.row_dimensions[r].height = 16
+    H = 5
+    col_headers(ws, H, ["Date", "Transaction", "Document No", "Due Date", "Amount (KES)",
+                        "Payments (KES)", "Balance (KES)", "Details"], col)
+    D = H + 1
+    for ri, tx in enumerate(txs, start=D):
+        is_open = tx["type"] == "Opening Balance"
+        is_cr = tx["type"] in ("Credit Note", "Payment Received")
+        bg = C["info_bg"] if is_open else (C["credit_row"] if is_cr else (C["alt_row"] if (ri - D) % 2 == 1 else None))
+        vals = [tx["date"], tx["type"], tx["doc"], tx["due"], tx["amount"], tx["payment"], tx["balance"], tx["details"]]
+        aligns = ["center", "left", "center", "center", "right", "right", "right", "left"]
+        fmts = [None, None, None, None, MFMT, MFMT, MFMT, None]
+        for ci, (v, a, f) in enumerate(zip(vals, aligns, fmts), 1):
+            fg = "000000"
+            if ci == 5 and v is not None: fg = C["credit_fg"] if v < 0 else C["debit_fg"]
+            if ci == 6 and v is not None: fg = C["credit_fg"]
+            if ci == 7 and v is not None: fg = C["neg_bal"] if v < 0 else "000000"
+            wc(ws, ri, ci, v, align=a, fmt=f, fg=fg, bg=bg, bdr=thin("bottom"), sz=9 if ci != 8 else 8)
+        ws.row_dimensions[ri].height = 15
+    L = D + len(txs) - 1
+    T = L + 1
+    ws.merge_cells(f"A{T}:D{T}")
+    wc(ws, T, 1, "TOTAL / CLOSING BALANCE", bold=True, fg=C["col_hdr_fg"], bg=col, align="right", bdr=thin(), ind=1)
+    for ci, f in [(5, f"=SUM(E{D}:E{L})"), (6, f"=SUM(F{D}:F{L})"), (7, f"=E{T}-F{T}")]:
+        c = ws.cell(row=T, column=ci, value=f)
+        c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+        c.fill = PatternFill("solid", start_color=col)
+        c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+    ws.cell(row=T, column=8).fill = PatternFill("solid", start_color=col)
+    ws.row_dimensions[T].height = 18
+    # reconciliation against the PDF's account summary
+    R = T + 2
+    wc(ws, R, 2, "CHECK AGAINST PDF SUMMARY", bold=True)
+    for ci, h in [(5, "Workbook"), (6, "Per PDF"), (7, "Difference")]:
+        wc(ws, R, ci, h, bold=True, align="right")
+    checks = [("Opening balance", f"=E{D}", hdr.get("opening_balance")),
+              ("Invoiced (net of credit notes)", f"=SUM(E{D+1}:E{L})", hdr.get("invoiced")),
+              ("Amount received", f"=F{T}", hdr.get("received")),
+              ("Balance due", f"=G{T}", hdr.get("balance_due"))]
+    for k, (lbl, f, pdfv) in enumerate(checks, start=1):
+        r = R + k
+        wc(ws, r, 2, lbl)
+        wc(ws, r, 5, f, align="right", fmt=MFMT)
+        wc(ws, r, 6, pdfv, align="right", fmt=MFMT, fg="0000FF")
+        wc(ws, r, 7, f"=IF(F{r}=\"\",\"\",ROUND(E{r}-F{r},2))", align="right", fmt=MFMT, bold=True)
+    ws.freeze_panes = f"A{D}"; ws.auto_filter.ref = f"A{H}:H{L}"
+    ws.page_setup.orientation = "landscape"; ws.page_setup.fitToPage = True; ws.page_setup.fitToWidth = 1
+    if alloc:
+        ws2 = wb.create_sheet("Payment Allocation"); ws2.sheet_properties.tabColor = col
+        for i, w in enumerate([12, 18, 12, 14, 16], 1):
+            ws2.column_dimensions[get_column_letter(i)].width = w
+        banner(ws2, 1, 5, "PAYMENT & CREDIT-NOTE ALLOCATION", col)
+        col_headers(ws2, 2, ["Date", "Transaction", "Reference", "Invoice Paid", "Amount (KES)"], col)
+        for ri, a in enumerate(alloc, start=3):
+            bg = C["alt_row"] if (ri - 3) % 2 == 1 else None
+            for ci, (v, al2, f) in enumerate(zip([a["date"], a["type"], a["ref"], a["invoice"], a["amount"]],
+                                                 ["center", "left", "center", "center", "right"],
+                                                 [None, None, None, None, MFMT]), 1):
+                wc(ws2, ri, ci, v, align=al2, fmt=f, bg=bg, bdr=thin("bottom"))
+        T2 = 3 + len(alloc)
+        ws2.merge_cells(f"A{T2}:D{T2}")
+        wc(ws2, T2, 1, "TOTAL ALLOCATED", bold=True, fg=C["col_hdr_fg"], bg=col, align="right", bdr=thin(), ind=1)
+        c = ws2.cell(row=T2, column=5, value=f"=SUM(E3:E{T2-1})")
+        c.font = Font(name="Arial", bold=True, size=9, color=C["col_hdr_fg"])
+        c.fill = PatternFill("solid", start_color=col)
+        c.number_format = MFMT; c.alignment = Alignment(horizontal="right", vertical="center"); c.border = thin()
+        ws2.freeze_panes = "A3"
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN CONVERT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2766,7 +2964,10 @@ def convert(pdf_bytes):
             t=page.extract_text()
             if t: lines.extend(t.split("\n"))
     fmt=detect(lines)
-    if fmt=="plascon":
+    if fmt=="printan":
+        hdr,txs,alloc=parse_printan(pdf_bytes,lines)
+        return fmt,len(txs),0,pages,excel_printan(hdr,txs,alloc)
+    elif fmt=="plascon":
         hdr,txs=parse_plascon(lines)
         return fmt,len(txs),0,pages,excel_plascon(hdr,txs)
     elif fmt=="dolphin":
@@ -2826,10 +3027,17 @@ def convert(pdf_bytes):
         hdr,txs=parse_basco(lines)
         return fmt,len(txs),0,pages,excel_basco(hdr,txs)
     return "unknown",0,0,pages,None
+
 # ══════════════════════════════════════════════════════════════════════════════
 # UNIVERSAL AI PARSER  (Claude — works on any supplier statement)
+#   • Reads the statement in page chunks so long statements are not cut off
+#   • Sends the PDF itself when a statement is scanned (no text layer)
+#   • Re-adds every line to check the running balance after extraction
 # ══════════════════════════════════════════════════════════════════════════════
-import urllib.request, urllib.error
+AI_MODEL        = "claude-sonnet-4-6"   # change if the API returns "model not found"
+PAGES_PER_CHUNK = 4                      # lower to 2-3 if you see "response was cut off"
+AI_MAX_TOKENS   = 16000
+
 def _get_api_key():
     try:
         key = st.secrets.get("ANTHROPIC_API_KEY", "")
@@ -2839,7 +3047,9 @@ def _get_api_key():
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if key: return key.strip()
     return st.session_state.get("_anthropic_key", "").strip() or None
-_AI_SYSTEM = """You are a financial document parser. Your only job is to extract data from a supplier statement PDF (provided as raw text) and return it as clean JSON.
+
+_AI_SYSTEM = """You are a financial document parser. Your only job is to extract data from a supplier statement (provided as raw text or as a PDF) and return it as clean JSON.
+
 Return ONLY a single JSON object with this exact structure — no markdown, no explanation, no preamble:
 {
   "supplier": "string — supplier/company name",
@@ -2872,53 +3082,83 @@ Return ONLY a single JSON object with this exact structure — no markdown, no e
   },
   "extra_fields": {}
 }
+
 Rules:
 - All monetary values must be plain numbers (no commas, no currency symbols).
 - If a field is not present in the document, use null.
-- Include EVERY line item in transactions — opening balance, invoices, receipts, credit notes, journals.
-- For debit/credit: use positive numbers. Receipts/payments go in credit; invoices go in debit.
-- If the statement has a single amount column with DR/CR indicators, split into debit or credit.
+- Include EVERY line item in transactions, in the order shown — opening balance, invoices, receipts, credit notes, journals.
+- For debit/credit: use positive numbers. Receipts/payments/credit notes go in credit; invoices go in debit.
+- If the statement has a single amount column with DR/CR indicators or negative/bracketed amounts, split into debit or credit.
+- Copy the running balance exactly as printed on each line.
 - Dates: preserve exactly as shown in the document.
 - extra_fields: capture any columns that don't fit the standard schema.
 """
-def _llm_extract(raw_text, api_key):
+
+def _call_claude(api_key, content):
     payload = json.dumps({
-        "model": "claude-sonnet-4-6",
-        "max_tokens": 4000,
-        "system": _AI_SYSTEM,
-        "messages": [{"role": "user",
-                       "content": f"Extract the statement data from this text:\n\n{raw_text[:12000]}"}]
+        "model": AI_MODEL, "max_tokens": AI_MAX_TOKENS, "system": _AI_SYSTEM,
+        "messages": [{"role": "user", "content": content}],
     }).encode()
     req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
-            "Content-Type":      "application/json",
-            "anthropic-version": "2023-06-01",
-            "x-api-key":         api_key,
-        },
-        method="POST",
-    )
+        "https://api.anthropic.com/v1/messages", data=payload, method="POST",
+        headers={"Content-Type": "application/json",
+                 "anthropic-version": "2023-06-01", "x-api-key": api_key})
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=180) as resp:
             result = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode()
-        if e.code == 401:
-            raise ValueError("Invalid API key — check your Anthropic API key and try again.") from e
-        if e.code == 429:
-            raise ValueError("Rate limit reached — wait a moment and try again.") from e
-        raise ValueError(f"API error {e.code}: {body[:200]}") from e
-    raw = result["content"][0]["text"].strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```[a-z]*\n?", "", raw)
-        raw = re.sub(r"\n?```$",       "", raw)
+        if e.code == 401: raise ValueError("Invalid API key — check it in the sidebar / Secrets.") from e
+        if e.code == 404: raise ValueError(f"Model '{AI_MODEL}' not found — update AI_MODEL at the top of the AI section.") from e
+        if e.code == 429: raise ValueError("Rate limit reached — wait a minute and try again.") from e
+        if e.code == 529: raise ValueError("Claude is overloaded right now — try again shortly.") from e
+        raise ValueError(f"API error {e.code}: {body[:300]}") from e
+    except urllib.error.URLError as e:
+        raise ValueError(f"Could not reach the Claude API: {e.reason}") from e
+    if result.get("stop_reason") == "max_tokens":
+        raise ValueError("Response was cut off — lower PAGES_PER_CHUNK and try again.")
+    raw = "".join(b.get("text", "") for b in result.get("content", []) if b.get("type") == "text").strip()
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
     return json.loads(raw)
+
+def _merge(parts):
+    out = {"transactions": [], "ageing": {}, "extra_fields": {}}
+    for p in parts:
+        for k, v in p.items():
+            if k == "transactions":
+                out["transactions"].extend(v or [])
+            elif k == "ageing":
+                for ak, av in (v or {}).items():
+                    if av is not None: out["ageing"][ak] = av          # later pages win (ageing is usually at the end)
+            elif k == "extra_fields":
+                out["extra_fields"].update(v or {})
+            elif k in ("closing_balance", "total_debit", "total_credit"):
+                if v is not None: out[k] = v                           # last non-null
+            elif out.get(k) in (None, "") and v not in (None, ""):
+                out[k] = v                                             # first non-null
+    return out
+
+def _check_balances(txs):
+    """Count rows whose running balance doesn't equal previous + debit - credit."""
+    bad, prev = 0, None
+    for t in txs:
+        b = t.get("balance")
+        if b is None: continue
+        try: b = float(b)
+        except (TypeError, ValueError): continue
+        if prev is not None:
+            exp = prev + float(t.get("debit") or 0) - float(t.get("credit") or 0)
+            if abs(exp - b) > 0.05: bad += 1
+        prev = b
+    return bad
+
 def _fmt_num(v):
     if v is None: return ""
     try: return f"{float(v):,.2f}"
     except: return str(v)
-def excel_universal(data, filename):
+
+def excel_universal(data, filename, issues=0):
     supplier  = data.get("supplier","Unknown Supplier") or "Unknown Supplier"
     customer  = data.get("customer","") or ""
     stmt_date = data.get("statement_date","") or ""
@@ -2986,9 +3226,12 @@ def excel_universal(data, filename):
                   tx.get("debit"), tx.get("credit"), tx.get("balance"), tx.get("note")]
         aligns = ["center","left","center","right","right","right","left"]
         fmts   = [None,None,None,MFMT,MFMT,MFMT,None]
+        bal = tx.get("balance")
+        try: neg = float(bal) < 0
+        except (TypeError, ValueError): neg = False
         fgs    = ["000000","000000","555555",
                   C["debit_fg"], C["credit_fg"],
-                  C["neg_bal"] if (tx.get("balance") or 0)<0 else C["credit_fg"],
+                  C["neg_bal"] if neg else C["credit_fg"],
                   "777777"]
         for ci,(v,a,f,fg) in enumerate(zip(vals,aligns,fmts,fgs),1):
             wc(ws,ri,ci,v,align=a,fmt=f,fg=fg,bg=bg,bdr=thin("bottom"))
@@ -3000,9 +3243,8 @@ def excel_universal(data, filename):
     c.fill=PatternFill("solid",start_color=AI_COLOR)
     c.alignment=Alignment(horizontal="right",vertical="center",indent=1)
     c.border=thin()
-    for ci,col,label in [(4,"D","debit"),(5,"E","credit")]:
-        formula = f"=SUM({col}{D}:{col}{T-1})"
-        c=ws.cell(row=T,column=ci,value=formula)
+    for ci,col in [(4,"D"),(5,"E")]:
+        c=ws.cell(row=T,column=ci,value=f"=SUM({col}{D}:{col}{T-1})")
         c.font=Font(name="Arial",bold=True,size=9,color="FFFFFF")
         c.fill=PatternFill("solid",start_color=AI_COLOR)
         c.number_format=MFMT
@@ -3049,8 +3291,9 @@ def excel_universal(data, filename):
             if bg2: lc.fill=bg2
             lc.border=thin("bottom")
             vc=ws2.cell(row=ri,column=2,value=val)
-            vc.font=Font(name="Arial",bold=bold,size=9,
-                         color=C["neg_bal"] if (val or 0)<0 else "000000")
+            try: vneg = float(val or 0) < 0
+            except (TypeError, ValueError): vneg = False
+            vc.font=Font(name="Arial",bold=bold,size=9,color=C["neg_bal"] if vneg else "000000")
             vc.number_format=MFMT
             vc.alignment=Alignment(horizontal="right",vertical="center")
             if bg2: vc.fill=bg2
@@ -3059,7 +3302,7 @@ def excel_universal(data, filename):
     ws3=wb.create_sheet("AI Extraction Info")
     ws3.sheet_properties.tabColor="AB47BC"
     ws3.column_dimensions["A"].width=28
-    ws3.column_dimensions["B"].width=50
+    ws3.column_dimensions["B"].width=60
     ws3.merge_cells("A1:B1")
     c=ws3["A1"]
     c.value="AI EXTRACTION DETAILS"
@@ -3068,17 +3311,17 @@ def excel_universal(data, filename):
     c.alignment=Alignment(horizontal="center",vertical="center")
     ws3.row_dimensions[1].height=24
     meta=[
-        ("Model Used","claude-sonnet-4-6"),
-        ("Extraction Method","Universal AI (no template required)"),
-        ("Transactions Found",str(len(txs))),
-        ("Supplier Detected",supplier),
-        ("Customer Detected",customer),
-        ("Statement Date",stmt_date),
-        ("Currency",currency),
-        ("",""),
-        ("⚠️ Tip","Always verify key figures (totals, closing balance) against the original PDF"),
-        ("✅ Accuracy","Monetary values are extracted exactly as shown in the source document"),
-        ("🔒 Privacy","PDF text is sent to Claude API for processing — do not upload confidential statements"),
+        ("Model Used", AI_MODEL),
+        ("Extraction Method", f"Universal AI, {PAGES_PER_CHUNK} pages per request"),
+        ("Transactions Found", str(len(txs))),
+        ("Running-balance check", "All lines tie" if issues == 0 else f"{issues} line(s) do not tie — check against the PDF"),
+        ("Supplier Detected", supplier),
+        ("Customer Detected", customer),
+        ("Statement Date", stmt_date),
+        ("Currency", currency),
+        ("", ""),
+        ("⚠️ Tip", "Always verify key figures (totals, closing balance) against the original PDF"),
+        ("🔒 Privacy", "The statement is sent to the Claude API for processing — do not upload confidential documents"),
     ]
     for ri,(lbl,val) in enumerate(meta,start=2):
         lc=ws3.cell(row=ri,column=1,value=lbl)
@@ -3087,23 +3330,45 @@ def excel_universal(data, filename):
         lc.alignment=Alignment(horizontal="left",vertical="center",indent=1)
         lc.border=thin("bottom")
         vc=ws3.cell(row=ri,column=2,value=val)
-        vc.font=Font(name="Arial",size=9)
+        vc.font=Font(name="Arial",size=9,bold=(lbl=="Running-balance check"),
+                     color=("2E7D32" if issues == 0 else "C62828") if lbl=="Running-balance check" else "000000")
         vc.alignment=Alignment(horizontal="left",vertical="center",indent=1)
         vc.border=thin("bottom")
         ws3.row_dimensions[ri].height=16
     buf=io.BytesIO(); wb.save(buf); buf.seek(0); return buf
+
 def convert_ai(pdf_bytes, filename, api_key):
-    lines=[]
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        pages=len(pdf.pages)
-        for page in pdf.pages:
-            t=page.extract_text()
-            if t: lines.extend(t.split("\n"))
-    raw_text="\n".join(lines)
-    data=_llm_extract(raw_text, api_key)
-    txs=data.get("transactions") or []
-    buf=excel_universal(data, filename)
-    return "ai", len(txs), 0, pages, buf, data.get("supplier","Unknown")
+        page_texts = [(p.extract_text() or "") for p in pdf.pages]
+    pages = len(page_texts)
+    parts = []
+    if sum(len(t.strip()) for t in page_texts) < 50:
+        # scanned PDF — no text layer, so send the PDF itself for Claude to read
+        content = [{"type": "document",
+                    "source": {"type": "base64", "media_type": "application/pdf",
+                               "data": base64.b64encode(pdf_bytes).decode()}},
+                   {"type": "text", "text": "Extract the statement data from this PDF."}]
+        parts.append(_call_claude(api_key, content))
+    else:
+        chunks = [page_texts[i:i + PAGES_PER_CHUNK] for i in range(0, pages, PAGES_PER_CHUNK)]
+        bar = st.progress(0.0, text="Reading statement…")
+        for n, chunk in enumerate(chunks, 1):
+            first = (n - 1) * PAGES_PER_CHUNK + 1
+            last = first + len(chunk) - 1
+            prompt = (f"This is part {n} of {len(chunks)} of the statement (pages {first}–{last} of {pages}). "
+                      "Extract ONLY the transactions that appear in this part, in order. "
+                      "Do not repeat an opening or brought-forward balance that belongs to an earlier part. "
+                      "Header, ageing and closing fields may be null if they are not shown here.\n\n"
+                      + "\n".join(chunk))
+            parts.append(_call_claude(api_key, prompt))
+            bar.progress(n / len(chunks), text=f"Read pages {first}–{last} of {pages}")
+        bar.empty()
+    data = _merge(parts)
+    txs = data.get("transactions") or []
+    issues = _check_balances(txs)
+    buf = excel_universal(data, filename, issues)
+    return "ai", len(txs), issues, pages, buf, data.get("supplier", "Unknown") or "Unknown"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # UI
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3131,6 +3396,7 @@ st.markdown("""
 .key-warn{border-color:#fb8c00;background:#fff8e1;color:#e65100}
 </style>
 """, unsafe_allow_html=True)
+
 with st.sidebar:
     st.markdown("## ⚙️ Settings")
     st.markdown("---")
@@ -3166,6 +3432,7 @@ with st.sidebar:
         if manual_key:
             st.session_state["_anthropic_key"] = manual_key
             st.success("Key saved for this session ✅")
+    st.caption(f"Model: `{AI_MODEL}` · {PAGES_PER_CHUNK} pages per request")
     st.markdown("---")
     st.markdown("### 📖 How to add a permanent key")
     with st.expander("Streamlit Cloud (recommended)"):
@@ -3189,6 +3456,7 @@ streamlit run app.py
 export ANTHROPIC_API_KEY=sk-ant-api03-...
 streamlit run app.py
 ```
+Or create `.streamlit/secrets.toml` next to `app.py` (add it to `.gitignore`).
         ''')
     with st.expander("Get an API key"):
         st.markdown('''
@@ -3196,9 +3464,11 @@ streamlit run app.py
 2. Sign in / create an account
 3. Navigate to **API Keys**
 4. Click **Create Key** — copy and save it securely
+5. Add credit under **Billing** (API usage is billed separately)
         ''')
     st.markdown("---")
     st.caption("Statement PDF → Excel · Files never stored")
+
 mode = st.radio(
     "Conversion mode:",
     ["🔵  Rule-Based  (fast · free · known suppliers)",
@@ -3206,6 +3476,7 @@ mode = st.radio(
     horizontal=True,
 )
 use_ai = mode.startswith("🤖")
+
 if use_ai:
     api_key = _get_api_key()
     if not api_key:
@@ -3214,27 +3485,29 @@ if use_ai:
   <h3>🔑 API Key Required</h3>
   <p>AI Mode needs an Anthropic API key. Enter it in the <b>sidebar → AI Mode — API Key</b>,
   or add it to Streamlit Secrets / your environment variable.<br>
-  No key? Get one free at <b>console.anthropic.com</b></p>
+  Get one at <b>console.anthropic.com</b></p>
 </div>""", unsafe_allow_html=True)
     else:
         st.markdown("""
 <div class="ai-banner">
   <h3>🤖 AI Universal Parser — powered by Claude</h3>
-  <p>Upload <b>any</b> supplier statement PDF. Claude reads the document, understands its
-  structure, and extracts all transactions into a formatted Excel — no template required.</p>
+  <p>Upload <b>any</b> supplier statement PDF. Claude reads it page by page, extracts every
+  transaction into a formatted Excel and checks each running balance — no template required.</p>
   <p style="margin-top:8px;font-size:.8rem;opacity:.75">
-  ⚠️ PDF text is sent to the Claude API &nbsp;·&nbsp;
+  ⚠️ The statement is sent to the Claude API &nbsp;·&nbsp;
   Do not upload confidential documents &nbsp;·&nbsp;
   Always verify totals against the original PDF</p>
 </div>""", unsafe_allow_html=True)
 else:
     api_key = None
+
 uploaded = st.file_uploader(
     "Drop your PDF here",
     type=["pdf","PDF"],
     label_visibility="collapsed",
     key="pdf_upload",
 )
+
 if uploaded:
     st.markdown(f"📎 **Uploaded:** `{uploaded.name}` &nbsp;({uploaded.size/1024:.1f} KB)")
     pdf_bytes = uploaded.read()
@@ -3243,14 +3516,14 @@ if uploaded:
         if not api_key:
             st.error("❌ No API key found. Enter your Anthropic API key in the sidebar first.")
             st.stop()
-        with st.spinner("🤖 Claude is reading your statement… (10–20 seconds)"):
+        with st.spinner("🤖 Claude is reading your statement…"):
             try:
-                fmt,tx_count,_,pages,buf,supplier = convert_ai(pdf_bytes, uploaded.name, api_key)
+                fmt, tx_count, issues, pages, buf, supplier = convert_ai(pdf_bytes, uploaded.name, api_key)
             except ValueError as e:
                 st.error(f"❌ {e}")
                 st.stop()
             except json.JSONDecodeError as e:
-                st.error(f"❌ AI returned unexpected output: {e}. Try again.")
+                st.error(f"❌ AI returned unexpected output: {e}. Try again, or lower PAGES_PER_CHUNK.")
                 st.stop()
             except Exception as e:
                 st.error(f"❌ Unexpected error: {e}")
@@ -3261,7 +3534,11 @@ if uploaded:
         🧾 {tx_count} transactions &nbsp;·&nbsp;
         🏢 {supplier}
         </div>""", unsafe_allow_html=True)
-        st.caption("✅ Check the **AI Extraction Info** sheet in the Excel file for verification tips.")
+        if issues:
+            st.warning(f"⚠️ {issues} line(s) don't tie to the running balance — check those rows against the PDF.")
+        else:
+            st.success("✅ Every running balance ties — no lines missed.")
+        st.caption("✅ See the **AI Extraction Info** sheet in the Excel file for details.")
         st.write("")
         st.download_button(
             "⬇️  Download AI-Extracted Excel",
@@ -3281,7 +3558,7 @@ if uploaded:
 <div class="ai-banner" style="margin-top:12px">
   <h3>💡 Try AI Mode</h3>
   <p>Select <b>🤖 AI Mode</b> in the mode selector above and re-upload your PDF.
-  Claude will automatically read and extract any statement format — no setup needed.</p>
+  Claude will read and extract any statement format — no setup needed.</p>
 </div>""", unsafe_allow_html=True)
         else:
             labels = {
@@ -3299,6 +3576,7 @@ if uploaded:
                 "dolphin":"Dolphin Ricambi Ltd",
                 "simba":"Simba Corporation Ltd",
                 "plascon":"Kansai Plascon Kenya Ltd",
+                "printan":"Printan Limited",
             }
             label   = labels.get(fmt, fmt)
             chq_txt = f" · {chq_count} cheques" if chq_count else ""
@@ -3314,6 +3592,7 @@ if uploaded:
                 file_name=Path(uploaded.name).stem+"_converted.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
+
 st.markdown("---")
 st.markdown(
     '<div class="footer-note">✨ Files processed in memory · never stored · free to use ✨</div>',
