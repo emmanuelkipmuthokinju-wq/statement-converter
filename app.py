@@ -4,7 +4,10 @@ import datetime as _dt
 import urllib.request, urllib.error
 import pdfplumber
 import openpyxl
-import xlrd
+try:
+    import xlrd                      # needed only for the M-Pesa .xls files
+except ImportError:
+    xlrd = None
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from pathlib import Path
@@ -38,31 +41,45 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 :root{
-  --ink:#14213D; --muted:#5B6474; --line:#E3E6EC; --card:#FFFFFF;
-  --bg:#F5F6F8; --accent:#2F5BEA; --accent-soft:#EAF0FE; --ok:#1E7A4F; --ok-soft:#E8F5EE;
+  /* brand colours */
+  --green:#8AC352; --green-dk:#6FA83A; --green-soft:#EEF7E5;
+  --orange:#FF5634; --orange-soft:#FFEDE8;
+  --purple:#966E8F; --purple-dk:#7A5574; --purple-soft:#F3EDF2;
+  --charcoal:#020407;
+  /* neutrals */
+  --ink:#1B1D22; --muted:#5B6070; --line:#E4E2E6; --card:#FFFFFF; --bg:#F7F6F8;
+  --accent:var(--orange); --accent-soft:var(--orange-soft);
+  --ok:#3F7A1E; --ok-soft:var(--green-soft);
 }
 html, body, .stApp, [class*="css"]{font-family:'Inter',system-ui,sans-serif;}
 .stApp{background:var(--bg);}
 .stApp, .stApp p, .stApp li, .stApp label, .stApp span, .stMarkdown, .stCaption{color:var(--ink);}
 .block-container{padding-top:2.5rem;max-width:760px;}
 
+/* three-colour brand strip across the top of the page */
+.stApp::before{content:"";position:fixed;top:0;left:0;right:0;height:5px;z-index:999991;
+  background:linear-gradient(90deg,var(--orange) 0 33.3%,var(--green) 33.3% 66.6%,var(--purple) 66.6% 100%)}
+
 .app-head{display:flex;align-items:center;gap:14px;margin-bottom:6px}
-.app-logo{width:44px;height:44px;border-radius:12px;background:var(--accent);
-  color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:20px}
-.app-head h1{font-size:1.6rem;font-weight:700;margin:0;color:var(--ink);letter-spacing:-.3px}
+.app-logo{width:44px;height:44px;border-radius:12px;overflow:hidden;display:flex;flex-shrink:0;
+  box-shadow:0 1px 3px rgba(2,4,7,.15)}
+.app-logo span{flex:1}
+.app-logo .o{background:var(--orange)} .app-logo .g{background:var(--green)} .app-logo .p{background:var(--purple)}
+.app-head h1{font-size:1.6rem;font-weight:700;margin:0;color:var(--charcoal);letter-spacing:-.3px}
 .app-sub{color:var(--muted);font-size:.95rem;margin:0 0 22px}
 
-.step{font-size:.78rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;
-  color:var(--muted);margin:18px 0 6px}
+.step{font-size:.78rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--purple-dk);margin:18px 0 6px;display:flex;align-items:center;gap:8px}
+.step::before{content:"";width:10px;height:10px;border-radius:3px;background:var(--green)}
 
 div[role="radiogroup"]{gap:8px}
 div[role="radiogroup"] label{background:var(--card);border:1px solid var(--line);
   border-radius:10px;padding:8px 14px;margin:0!important}
-div[role="radiogroup"] label:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}
+div[role="radiogroup"] label:has(input:checked){border-color:var(--orange);background:var(--orange-soft)}
 
 section[data-testid="stFileUploaderDropzone"]{
-  background:var(--card)!important;border:1.5px dashed #B9C2D3!important;border-radius:12px!important}
-section[data-testid="stFileUploaderDropzone"]:hover{border-color:var(--accent)!important}
+  background:var(--card)!important;border:1.5px dashed #C9C0C8!important;border-radius:12px!important}
+section[data-testid="stFileUploaderDropzone"]:hover{border-color:var(--green)!important;background:var(--green-soft)!important}
 
 div[data-testid="stExpander"]{background:var(--card)!important;border:1px solid var(--line)!important;
   border-radius:12px!important;box-shadow:none!important}
@@ -71,23 +88,29 @@ div[data-testid="stExpander"] summary, div[data-testid="stExpander"] summary *{c
 .note{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--accent);
   border-radius:10px;padding:12px 16px;color:var(--ink);font-size:.9rem;margin:8px 0}
 .note b{color:var(--ink)}
-.result{background:var(--ok-soft);border:1px solid #BFE3CF;border-radius:12px;
+.result{background:var(--ok-soft);border:1px solid var(--green);border-radius:12px;
   padding:14px 18px;color:var(--ok);font-weight:600;margin:12px 0 4px}
 .file-chip{display:inline-block;background:var(--card);border:1px solid var(--line);
   border-radius:8px;padding:6px 12px;font-size:.88rem;color:var(--ink);margin:6px 0}
 
-div[data-testid="stMetric"]{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px}
+div[data-testid="stMetric"]{background:var(--card);border:1px solid var(--line);border-radius:12px;
+  padding:12px 16px;border-top:3px solid var(--purple)}
+div:is([data-testid="column"],[data-testid="stColumn"]):nth-of-type(1) div[data-testid="stMetric"]{border-top-color:var(--orange)}
+div:is([data-testid="column"],[data-testid="stColumn"]):nth-of-type(2) div[data-testid="stMetric"]{border-top-color:var(--green)}
 div[data-testid="stMetricLabel"] *{color:var(--muted)!important}
-div[data-testid="stMetricValue"]{color:var(--ink)!important;font-size:1.4rem!important}
+div[data-testid="stMetricValue"]{color:var(--charcoal)!important;font-size:1.4rem!important}
 
-.stDownloadButton>button{background:var(--accent)!important;color:#fff!important;border:none!important;
-  border-radius:10px!important;padding:12px 20px!important;font-weight:600!important;width:100%!important}
-.stDownloadButton>button:hover{background:#2348C4!important}
-.stDownloadButton>button *{color:#fff!important}
+.stDownloadButton, .stDownloadButton>div, [data-testid="stDownloadButton"],
+div[data-testid="stElementContainer"]:has(.stDownloadButton){width:100%!important;max-width:100%!important}
+.stDownloadButton button{background:var(--green)!important;color:var(--charcoal)!important;border:none!important;
+  border-radius:10px!important;padding:12px 20px!important;font-weight:700!important;width:100%!important}
+.stDownloadButton button:hover{background:var(--green-dk)!important}
+.stDownloadButton button *{color:var(--charcoal)!important}
 
 section[data-testid="stSidebar"]{background:var(--card);border-right:1px solid var(--line)}
+section[data-testid="stSidebar"] h3{color:var(--purple-dk)!important}
 .key-status{border-radius:10px;padding:10px 12px;font-size:.85rem;margin:6px 0 10px;border:1px solid}
-.key-ok{background:var(--ok-soft);border-color:#BFE3CF;color:var(--ok)}
+.key-ok{background:var(--ok-soft);border-color:var(--green);color:var(--ok)}
 .key-warn{background:#FFF6E5;border-color:#F3D9A4;color:#8A5A00}
 
 .foot{color:var(--muted);font-size:.8rem;text-align:center;margin-top:28px}
@@ -96,7 +119,7 @@ footer, #MainMenu{visibility:hidden}
 """, unsafe_allow_html=True)
 
 st.markdown(f"""
-<div class="app-head"><div class="app-logo">⇄</div><h1>Statement → Excel</h1></div>
+<div class="app-head"><div class="app-logo"><span class="o"></span><span class="g"></span><span class="p"></span></div><h1>Statement → Excel</h1></div>
 <p class="app-sub">Convert supplier statement PDFs into formatted Excel workbooks
 ({len(SUPPLIERS)} supplier layouts built in; AI mode reads any other), or combine the
 daily branch M-Pesa statements into one workbook.</p>
@@ -187,6 +210,9 @@ def _mp_rows(name, data):
         out = [["" if v is None else v for v in r] for r in wb.worksheets[0].iter_rows(values_only=True)]
         wb.close()
         return out
+    if xlrd is None:
+        raise ValueError("the 'xlrd' package is not installed — add a line 'xlrd' to "
+                         "requirements.txt in your GitHub repo and reboot the app")
     book = xlrd.open_workbook(file_contents=data)
     s = book.sheet_by_index(0)
     out = []
