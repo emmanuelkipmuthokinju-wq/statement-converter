@@ -1,8 +1,10 @@
 import streamlit as st
-import io, re, json, os, base64
+import io, re, json, os, base64, csv, zipfile
+import datetime as _dt
 import urllib.request, urllib.error
 import pdfplumber
 import openpyxl
+import xlrd
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from pathlib import Path
@@ -95,9 +97,416 @@ footer, #MainMenu{visibility:hidden}
 
 st.markdown(f"""
 <div class="app-head"><div class="app-logo">⇄</div><h1>Statement → Excel</h1></div>
-<p class="app-sub">Convert supplier statement PDFs into formatted Excel workbooks.
-{len(SUPPLIERS)} supplier layouts built in; AI mode reads any other.</p>
+<p class="app-sub">Convert supplier statement PDFs into formatted Excel workbooks
+({len(SUPPLIERS)} supplier layouts built in; AI mode reads any other), or combine the
+daily branch M-Pesa statements into one workbook.</p>
 """, unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# M-PESA DAILY COMBINE
+#   Merges the Safaricom "MerchantAccount_All" branch statements (.xls / .xlsx /
+#   .zip of them) into one workbook laid out like "29TH OCT 2026 MPESA.xls":
+#     • one sheet per branch (the raw statement, unchanged)
+#     • TEMP  – Branch | Total Paid In   (linked to each branch sheet)
+#     • SUMM  – date, end-of-day checklist in the usual branch order,
+#               branch→total table and the horizontal row
+#     • SAIFY – optional Sage M-Pesa receipts export, with the filter-aware
+#               Debit / Credit totals in O1 / P1
+#   To make a NEW branch permanent, add its short code to SHORTCODE_BRANCH and
+#   its name to SUMM_ORDER (where you want it in the checklist).
+# ══════════════════════════════════════════════════════════════════════════════
+SHORTCODE_BRANCH = {
+    "1270226": "THINDIGWA",   "1371770": "EMBU 2",      "148769": "JUJA",
+    "148770": "MURANGA",      "148771": "EMBU",         "148772": "RUAKA",
+    "3538859": "KISERIAN",    "3539029": "NAKURU TOWN", "3539031": "MTWAPA",
+    "3567511": "NAROK",       "4052857": "KIMBO",       "4326887": "NANYUKI",
+    "4566467": "NYAHURURU",   "4566587": "OL KALOU",    "5065418": "KAKAMEGA",
+    "5065920": "GITHURAI",    "540999": "KIAMBU",       "5468634": "MERU",
+    "5494834": "DIANI",       "5495694": "MACHAKOS",    "5495696": "RUIRU NDANI",
+    "5511082": "KASARANI 2",  "5523926": "RIRUTA",      "5523996": "NGONG TOWN",
+    "5523998": "OJ",          "5525284": "KITENGELA 2", "5525410": "BEE CENTER",
+    "5548389": "KARATINA",    "5623016": "KIAMBU TOWN", "5924878": "GACHIE",
+    "6223937": "RUAI",        "6274703": "RUNDA",       "6348416": "KIKUYU",
+    "6383286": "GREENSPOT",   "6460326": "SYOKIMAU",    "654219": "UTAWALA",
+    "654220": "ROASTERS",     "6568021": "ALL SOPS",    "6615545": "NAKURU",
+    "6623872": "NAIVASHA",    "6646388": "MAKUPA",      "6740382": "MAKONGENI",
+    "6763236": "KITUI",       "6830450": "NYERI",       "6830565": "ROMA",
+    "6830570": "PIONEER",     "6847953": "MWEA",        "7011935": "THIKA",
+    "7283655": "NGONG",       "7368297": "RONGAI",      "7534035": "KERUGOYA",
+    "764118": "KITENGELA",    "7680630": "SAIKA",       "7815591": "KAMAKIS",
+    "7986326": "KENOL",       "9660101": "JOGOO ROAD",  "987622": "KASARANI",
+    "9960047": "ZIMMERMAN",
+}
+
+SUMM_ORDER = [
+    "KASARANI", "JUJA", "RUAKA", "UTAWALA", "ROASTERS", "EMBU", "MURANGA", "KITENGELA",
+    "KIAMBU", "THIKA", "NGONG", "RONGAI", "KERUGOYA", "KARATINA", "KAMAKIS", "SAIKA",
+    "KENOL", "RUAI", "RUNDA", "GREENSPOT", "SYOKIMAU", "KIKUYU", "ALL SOPS", "NAKURU",
+    "NAIVASHA", "MAKUPA", "MAKONGENI", "KITUI", "MWEA", "NYERI", "PIONEER", "ROMA",
+    "KAKAMEGA", "GITHURAI", "MERU", "RIRUTA", "NGONG TOWN", "DIANI", "OJ", "RUIRU NDANI",
+    "MACHAKOS", "KASARANI 2", "KITENGELA 2", "BEE CENTER", "KIAMBU TOWN", "GACHIE",
+    "KISERIAN", "NAKURU TOWN", "MTWAPA", "NAROK", "JOGOO ROAD", "ZIMMERMAN", "OL KALOU",
+    "NYAHURURU", "KIMBO", "NANYUKI", "THINDIGWA", "EMBU 2",
+]
+
+SAIFY_HEADERS = ["Trans Date", "Account", "Module", "Trans Code", "Post Dated", "Reference",
+                 "Description", "Order Number", "Amount Excl", "Tax Type", "AMOUNT", "Is Debit",
+                 "Amount Incl", "Project Code", "Rep Code", "GL Contra Code"]
+
+MP_NUM  = '#,##0.00;-#,##0.00;"-"'
+MP_FILL = PatternFill("solid", start_color="1B5E20")
+MP_HDR  = Font(name="Arial", bold=True, color="FFFFFF", size=10)
+MP_BOLD = Font(name="Arial", bold=True, size=10)
+MP_BASE = Font(name="Arial", size=10)
+MP_RED  = Font(name="Arial", bold=True, size=10, color="C62828")
+MP_LINE = Border(bottom=Side(style="thin", color="BDBDBD"))
+
+
+def _mp_expand(uploads):
+    """(name, bytes) for every spreadsheet, unpacking .zip files."""
+    for name, data in uploads:
+        if name.lower().endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for info in z.infolist():
+                    n = info.filename
+                    if info.is_dir() or "__MACOSX" in n or Path(n).name.startswith(("~$", ".")):
+                        continue
+                    if n.lower().endswith((".xls", ".xlsx", ".csv")):
+                        yield Path(n).name, z.read(info)
+        else:
+            yield name, data
+
+
+def _mp_rows(name, data):
+    """First sheet of an .xls/.xlsx/.csv as a list of row lists."""
+    if name.lower().endswith(".csv"):
+        text = data.decode("utf-8-sig", errors="replace")
+        return [list(r) for r in csv.reader(io.StringIO(text))]
+    if data[:4] == b"PK\x03\x04":                      # real .xlsx (even if named .xls)
+        wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        out = [["" if v is None else v for v in r] for r in wb.worksheets[0].iter_rows(values_only=True)]
+        wb.close()
+        return out
+    book = xlrd.open_workbook(file_contents=data)
+    s = book.sheet_by_index(0)
+    out = []
+    for r in range(s.nrows):
+        row = []
+        for c in range(s.ncols):
+            cell = s.cell(r, c)
+            if cell.ctype == xlrd.XL_CELL_DATE:
+                row.append(xlrd.xldate.xldate_as_datetime(cell.value, book.datemode))
+            elif cell.ctype == xlrd.XL_CELL_BOOLEAN:
+                row.append(bool(cell.value))
+            else:
+                row.append(cell.value)
+        out.append(row)
+    return out
+
+
+def _mp_find(rows, label, max_rows=12):
+    for r, row in enumerate(rows[:max_rows]):
+        for c, v in enumerate(row):
+            if str(v).strip().lower() == label.lower():
+                return r, c
+    return None
+
+
+def _mp_num(v):
+    if v in (None, ""):
+        return None
+    try:
+        return float(str(v).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _mp_branch_label(holder, code):
+    """'NEW MUTHOKINJU HARDWARE LTD - NAKURU' → 'NAKURU' (short name for a new branch)."""
+    n = re.sub(r"\s+", " ", str(holder)).strip().upper()
+    n = re.sub(r"^NEW\s+MUTHOKINJU(\s+(HARDWARE|H/W))?(\s+(LTD|LIMITED))?\s*[-–.]?\s*", "", n)
+    n = re.sub(r"\s+BRANCH$", "", n).strip(" -.")
+    return n or code
+
+
+def _mp_sheet_name(name, used):
+    name = re.sub(r"[\[\]\*\?/\\:]", " ", name).strip()[:31] or "BRANCH"
+    base, n = name, 2
+    while name.upper() in used:
+        suffix = f" ({n})"
+        name = base[:31 - len(suffix)] + suffix
+        n += 1
+    return name
+
+
+def mp_parse_statement(name, rows):
+    """Pull the header facts out of one Safaricom merchant statement."""
+    pos = _mp_find(rows, "Short Code:")
+    if not pos:
+        return None
+    r, c = pos
+    code = rows[r][c + 1] if c + 1 < len(rows[r]) else ""
+    if isinstance(code, float) and code.is_integer():
+        code = int(code)
+    code = str(code).strip()
+    holder = ""
+    p = _mp_find(rows, "Account Holder:")
+    if p:
+        holder = str(rows[p[0]][p[1] + 1]).strip()
+    date = None
+    p = _mp_find(rows, "Time Period:")
+    if p:
+        for v in rows[p[0]][p[1] + 1:]:
+            if isinstance(v, _dt.datetime):
+                date = v.date(); break
+            m = re.match(r"(\d{2})-(\d{2})-(\d{4})", str(v))
+            if m:
+                date = _dt.date(int(m.group(3)), int(m.group(2)), int(m.group(1))); break
+    tp = _mp_find(rows, "Total Paid In:")
+    total_cell = (tp[0] + 1, tp[1] + 2) if tp else None          # 1-based (row, col) of the value
+    total = _mp_num(rows[tp[0]][tp[1] + 1]) if tp else None
+    hdr = _mp_find(rows, "Receipt No.", 15)
+    tx = sum(1 for row in rows[hdr[0] + 1:] if row and str(row[0]).strip()) if hdr else 0
+    return {"file": name, "code": code, "holder": holder, "date": date, "rows": rows,
+            "total": total or 0.0, "total_cell": total_cell,
+            "header_row": hdr[0] + 1 if hdr else None, "tx": tx}
+
+
+def mp_parse_saify(name, data):
+    """Sage M-Pesa receipts export → list of 16-value rows in SAIFY column order."""
+    rows = _mp_rows(name, data)
+    h = _mp_find(rows, "Trans Date", 20)
+    if not h:
+        raise ValueError(f"{name}: could not find the 'Trans Date' header row.")
+    hdr = [str(v).strip().lower() for v in rows[h[0]]]
+    idx = {k: (hdr.index(k.lower()) if k.lower() in hdr else None) for k in SAIFY_HEADERS}
+    out = []
+    for row in rows[h[0] + 1:]:
+        if not row or not any(str(v).strip() for v in row):
+            continue
+        vals = []
+        for k in SAIFY_HEADERS:
+            i = idx[k]
+            v = row[i] if i is not None and i < len(row) else ""
+            if k in ("Amount Excl", "Amount Incl", "Is Debit", "Post Dated"):
+                n = _mp_num(v)
+                v = (int(n) if n is not None and n.is_integer() and k in ("Is Debit", "Post Dated")
+                     else (n if n is not None else v))
+            if isinstance(v, _dt.datetime):
+                v = v.strftime("%d-%m-%Y")
+            vals.append(v)
+        out.append(vals)
+    return out
+
+
+def mpesa_combine(uploads, saify_upload=None):
+    """uploads: list of (filename, bytes). Returns (BytesIO, report dict)."""
+    stmts, skipped, dupes = {}, [], []
+    for name, data in _mp_expand(uploads):
+        try:
+            s = mp_parse_statement(name, _mp_rows(name, data))
+        except Exception as e:
+            skipped.append(f"{name} ({e})"); continue
+        if not s:
+            skipped.append(f"{name} (not an M-Pesa merchant statement)"); continue
+        if s["code"] in stmts:
+            dupes.append(f"{name} (short code {s['code']} already loaded)"); continue
+        stmts[s["code"]] = s
+    if not stmts:
+        raise ValueError("No M-Pesa merchant statements found in the upload.")
+
+    # sheet names & order: known branches in template order, new ones after
+    used, ordered = set(), []
+    for code, name in SHORTCODE_BRANCH.items():
+        if code in stmts:
+            stmts[code]["sheet"] = name; used.add(name.upper()); ordered.append(stmts[code])
+    unknown = []
+    for code, s in stmts.items():
+        if "sheet" not in s:
+            s["sheet"] = _mp_sheet_name(_mp_branch_label(s["holder"], code), used)
+            used.add(s["sheet"].upper()); ordered.append(s); unknown.append(f"{code} → {s['sheet']}")
+    missing = [n for c, n in SHORTCODE_BRANCH.items() if c not in stmts]
+    all_dates = [s["date"] for s in ordered if s["date"]]
+    day = max(set(all_dates), key=all_dates.count) if all_dates else _dt.date.today()   # majority date
+    off_date = [f"{s['sheet']} ({s['date'].strftime('%d-%m-%Y')})" for s in ordered
+                if s["date"] and s["date"] != day]
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    # ── branch sheets (raw statement copied as-is) ──
+    for s in ordered:
+        ws = wb.create_sheet(s["sheet"])
+        for r, row in enumerate(s["rows"], 1):
+            for c, v in enumerate(row, 1):
+                if v == "" or v is None:
+                    continue
+                cell = ws.cell(row=r, column=c, value=v)
+                cell.font = MP_BASE
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    cell.number_format = "#,##0.00"
+        for r in range(1, min(7, ws.max_row + 1)):
+            for c in range(1, ws.max_column + 1):
+                cell = ws.cell(row=r, column=c)
+                if isinstance(cell.value, str) and cell.value.endswith(":"):
+                    cell.font = MP_BOLD
+        if s["header_row"]:
+            for c in range(1, ws.max_column + 1):
+                ws.cell(row=s["header_row"], column=c).font = MP_BOLD
+            ws.freeze_panes = f"A{s['header_row'] + 1}"
+        for col, w in zip("ABCDEFGHIJKLMN", [25, 20, 20, 60, 14, 14, 14, 14, 10, 30, 40, 14, 10, 9]):
+            ws.column_dimensions[col].width = w
+
+    # ── TEMP ──
+    tp = wb.create_sheet("TEMP")
+    tp["A1"], tp["B1"] = "Branch", "Total Paid In"
+    for c in "AB":
+        tp[f"{c}1"].font, tp[f"{c}1"].fill = MP_HDR, MP_FILL
+    for i, s in enumerate(ordered, start=2):
+        tp.cell(row=i, column=1, value=s["sheet"]).font = MP_BASE
+        if s["total_cell"]:
+            ref = f"'{s['sheet']}'!{get_column_letter(s['total_cell'][1])}{s['total_cell'][0]}"
+            v = f"=IFERROR(VALUE({ref}),{ref})"
+        else:
+            v = s["total"]
+        cell = tp.cell(row=i, column=2, value=v)
+        cell.number_format, cell.font = MP_NUM, MP_BASE
+    tlast = len(ordered) + 1
+    tp.cell(row=tlast + 1, column=1, value="TOTAL").font = MP_BOLD
+    c = tp.cell(row=tlast + 1, column=2, value=f"=SUM(B2:B{tlast})"); c.font, c.number_format = MP_BOLD, MP_NUM
+    tp.column_dimensions["A"].width, tp.column_dimensions["B"].width = 18, 16
+    tp.freeze_panes = "A2"
+
+    # ── SUMM ──
+    sm = wb.create_sheet("SUMM")
+    sm["A1"] = _dt.datetime(day.year, day.month, day.day)
+    sm["A1"].number_format = 'dddd, mmmm dd, yyyy'; sm["A1"].font = MP_BOLD
+    for ref, txt in [("A2", "BRANCH"), ("B2", "CHECKLIST END OF DAY"), ("C2", "BAL C/D MPESA"),
+                     ("F1", "Branch"), ("G1", "Total Paid In")]:
+        sm[ref] = txt; sm[ref].font, sm[ref].fill = MP_HDR, MP_FILL
+    for i, s in enumerate(ordered, start=2):                         # F:G – every sheet with its total
+        sm.cell(row=i, column=6, value=s["sheet"]).font = MP_BASE
+        c = sm.cell(row=i, column=7, value=f"=TEMP!B{i}"); c.number_format, c.font = MP_NUM, MP_BASE
+    g_last = len(ordered) + 1
+    sm.cell(row=g_last + 1, column=6, value="TOTAL").font = MP_BOLD
+    c = sm.cell(row=g_last + 1, column=7, value=f"=SUM(G2:G{g_last})"); c.font, c.number_format = MP_BOLD, MP_NUM
+    summ = SUMM_ORDER + [s["sheet"] for s in ordered if s["sheet"] not in SUMM_ORDER]
+    for i, b in enumerate(summ, start=3):                            # A:B – checklist
+        sm.cell(row=i, column=1, value=b).font = MP_BASE
+        c = sm.cell(row=i, column=2, value=f'=IFERROR(VLOOKUP(A{i},$F$2:$G${g_last},2,0),"NOT RECEIVED")')
+        c.number_format = MP_NUM
+        c.font = MP_RED if b in missing else MP_BASE
+        sm.cell(row=i, column=3).number_format = MP_NUM
+        for col in (1, 2, 3):
+            sm.cell(row=i, column=col).border = MP_LINE
+    a_last = len(summ) + 2
+    sm.cell(row=a_last + 1, column=1, value="TOTAL").font = MP_BOLD
+    for col in "BC":
+        c = sm[f"{col}{a_last + 1}"]; c.value = f"=SUM({col}3:{col}{a_last})"; c.font, c.number_format = MP_BOLD, MP_NUM
+    for j, b in enumerate(summ):                                     # horizontal row J2:… / J3:…
+        col = 10 + j
+        sm.cell(row=2, column=col, value=b).font = MP_BOLD
+        c = sm.cell(row=3, column=col, value=f"=VLOOKUP({get_column_letter(col)}2,$A$3:$B${a_last},2,0)")
+        c.number_format = MP_NUM
+    for col, w in {"A": 15, "B": 22, "C": 18, "F": 15, "G": 16}.items():
+        sm.column_dimensions[col].width = w
+    for j in range(len(summ)):
+        sm.column_dimensions[get_column_letter(10 + j)].width = 13.5
+
+    # ── SAIFY ──
+    sf = wb.create_sheet("SAIFY")
+    saify_rows = mp_parse_saify(*saify_upload) if saify_upload else []
+    sf["O1"] = "=SUMPRODUCT(SUBTOTAL(103,OFFSET(N2,ROW(N2:N10000)-ROW(N2),0,1)),--(L2:L10000=0),M2:M10000)"
+    sf["P1"] = "=SUMPRODUCT(SUBTOTAL(103,OFFSET(N2,ROW(N2:N10000)-ROW(N2),0,1)),--(L2:L10000=1),M2:M10000)"
+    sf["N1"] = "Is Debit 0 | 1 →"
+    for c in ("N1", "O1", "P1"):
+        sf[c].font = MP_BOLD
+    sf["O1"].number_format = sf["P1"].number_format = MP_NUM
+    for ci, h in enumerate(SAIFY_HEADERS, 1):
+        c = sf.cell(row=2, column=ci, value=h); c.font, c.fill = MP_HDR, MP_FILL
+    for ri, vals in enumerate(saify_rows, start=3):
+        for ci, v in enumerate(vals, 1):
+            if ci == 11:
+                v = f'=IF(D{ri}="PM",I{ri},-I{ri})'
+            if v != "":
+                cell = sf.cell(row=ri, column=ci, value=v); cell.font = MP_BASE
+                if ci in (9, 11, 13):
+                    cell.number_format = "#,##0.00"
+    sf.auto_filter.ref = f"A2:P{max(3, len(saify_rows) + 2)}"
+    sf.freeze_panes = "A3"
+    for col, w in zip("ABCDEFGHIJKLMNOP", [12, 13, 7, 9, 9, 14, 38, 15, 13, 8, 13, 8, 13, 18, 14, 14]):
+        sf.column_dimensions[col].width = w
+
+    wb.active = wb.sheetnames.index("SUMM")
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    report = {"date": day, "off_date": off_date, "branches": len(ordered),
+              "total": sum(s["total"] for s in ordered),
+              "transactions": sum(s["tx"] for s in ordered),
+              "missing": missing, "unknown": unknown, "skipped": skipped, "dupes": dupes,
+              "saify_rows": len(saify_rows),
+              "table": [{"Branch": s["sheet"], "Short code": s["code"], "Transactions": s["tx"],
+                         "Total Paid In": s["total"]} for s in ordered]}
+    return buf, report
+
+
+def mpesa_output_name(day):
+    n = day.day
+    suf = "TH" if 10 <= n % 100 <= 20 else {1: "ST", 2: "ND", 3: "RD"}.get(n % 10, "TH")
+    return f"{n}{suf} {day.strftime('%b').upper()} {day.year} MPESA.xlsx"
+
+
+def render_mpesa_ui():
+    st.markdown('<div class="step">2 · Upload branch M-Pesa statements</div>', unsafe_allow_html=True)
+    st.markdown('<div class="note">Upload the Safaricom <b>MerchantAccount_All</b> files for one day — '
+                'select them all at once, or upload the <b>.zip</b>. Each file becomes a branch sheet, '
+                'and TEMP / SUMM are filled in automatically.</div>', unsafe_allow_html=True)
+    files = st.file_uploader("M-Pesa statements", type=["xls", "xlsx", "zip", "csv"],
+                             accept_multiple_files=True, label_visibility="collapsed", key="mpesa_upload")
+    with st.expander("Optional: add the Sage M-Pesa receipts export for the SAIFY sheet"):
+        saify = st.file_uploader("Sage export (must contain a 'Trans Date' header row)",
+                                 type=["xls", "xlsx", "csv"], key="saify_upload")
+    if not files:
+        return
+    st.markdown('<div class="step">3 · Download</div>', unsafe_allow_html=True)
+    with st.spinner("Combining statements…"):
+        try:
+            buf, rep = mpesa_combine([(f.name, f.getvalue()) for f in files],
+                                     (saify.name, saify.getvalue()) if saify else None)
+        except Exception as e:
+            st.error(f"Combine failed: {e}"); st.stop()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Branches", f"{rep['branches']} / {len(SHORTCODE_BRANCH)}")
+    c2.metric("Transactions", f"{rep['transactions']:,}")
+    c3.metric("Total Paid In", f"{rep['total']:,.0f}")
+    if rep["off_date"]:
+        st.warning(f"These statements are not for {rep['date'].strftime('%d-%m-%Y')} — re-download them: "
+                   + ", ".join(rep["off_date"]))
+    if rep["missing"]:
+        st.warning(f"{len(rep['missing'])} branch(es) not uploaded — shown as NOT RECEIVED in SUMM: "
+                   + ", ".join(rep["missing"]))
+    if rep["unknown"]:
+        st.info("New short code(s) added at the end: " + "; ".join(rep["unknown"]))
+    if rep["dupes"]:
+        st.info("Duplicates ignored: " + "; ".join(rep["dupes"]))
+    if rep["skipped"]:
+        st.warning("Skipped: " + "; ".join(rep["skipped"]))
+    if saify:
+        st.caption(f"SAIFY: {rep['saify_rows']:,} Sage rows added.")
+    st.markdown(f'<div class="result">✓ Combined {rep["branches"]} branches for '
+                f'{rep["date"].strftime("%A, %d %B %Y")}</div>', unsafe_allow_html=True)
+    st.download_button("Download combined Excel", data=buf, file_name=mpesa_output_name(rep["date"]),
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with st.expander("Branch totals"):
+        st.dataframe(rep["table"], use_container_width=True, hide_index=True)
+
+# ── Step 1: choose the task ───────────────────────────────────────────────────
+st.markdown('<div class="step">1 · What do you want to do?</div>', unsafe_allow_html=True)
+task = st.radio("Task", ["Convert PDF → Excel", "Combine M-Pesa Excels"],
+                horizontal=True, label_visibility="collapsed", key="task")
+if task.startswith("Combine"):
+    render_mpesa_ui()
+    st.markdown('<div class="foot">Files are processed in memory and never stored.</div>', unsafe_allow_html=True)
+    st.stop()
 
 # ── Colours & helpers ──────────────────────────────────────────────────────────
 C = dict(savannah_orange="E8540A", national_blue="1565C0", mombasa_green="1B5E20",
@@ -3390,8 +3799,8 @@ ANTHROPIC_API_KEY = "sk-ant-api03-..."
 **New key:** console.anthropic.com → API Keys. Add credit under Billing.
         ''')
 
-# ── Step 1: mode ──────────────────────────────────────────────────────────────
-st.markdown('<div class="step">1 · Conversion mode</div>', unsafe_allow_html=True)
+# ── Step 2: conversion mode ───────────────────────────────────────────────────
+st.markdown('<div class="step">2 · Conversion mode</div>', unsafe_allow_html=True)
 mode = st.radio("Conversion mode", ["Standard (built-in suppliers)", "AI (any supplier)"],
                 horizontal=True, label_visibility="collapsed")
 use_ai = mode.startswith("AI")
@@ -3405,15 +3814,15 @@ if use_ai:
         st.markdown('<div class="note"><b>API key needed.</b> Add your Anthropic key in the sidebar to use AI mode.</div>',
                     unsafe_allow_html=True)
 
-# ── Step 2: upload ────────────────────────────────────────────────────────────
-st.markdown('<div class="step">2 · Upload statement</div>', unsafe_allow_html=True)
+# ── Step 3: upload ────────────────────────────────────────────────────────────
+st.markdown('<div class="step">3 · Upload statement</div>', unsafe_allow_html=True)
 uploaded = st.file_uploader("PDF statement", type=["pdf", "PDF"],
                             label_visibility="collapsed", key="pdf_upload")
 
-# ── Step 3: result ────────────────────────────────────────────────────────────
+# ── Step 4: result ────────────────────────────────────────────────────────────
 if uploaded:
     pdf_bytes = uploaded.read()
-    st.markdown('<div class="step">3 · Download</div>', unsafe_allow_html=True)
+    st.markdown('<div class="step">4 · Download</div>', unsafe_allow_html=True)
 
     if use_ai:
         api_key = _get_api_key()
